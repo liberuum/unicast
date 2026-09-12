@@ -1,0 +1,17 @@
+#!/bin/sh
+# Thin client for the omarchy-castd daemon.
+#
+# Forwards the QML panel's argv verbs (status/discover/connect/disconnect/
+# pause/resume/...) to the persistent daemon over its unix socket. Prefers an
+# installed omarchy-castd (PATH, e.g. /usr/bin or ~/.local/bin); falls back to
+# a local cargo build when running from the source tree.
+if command -v omarchy-castd >/dev/null 2>&1; then
+  exec omarchy-castd --client "$@"
+fi
+HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+for bin in "$HOME/.local/bin/omarchy-castd" "${XDG_CACHE_HOME:-$HOME/.cache}/omarchy-cast/target/release/omarchy-castd" "$HERE/../target/release/omarchy-castd" "$HERE/../target/debug/omarchy-castd" "$HERE/omarchy-castd"; do
+  if [ -x "$bin" ]; then
+    exec "$bin" --client "$@"
+  fi
+done
+printf '%s\n' '{"ok": false, "error": "omarchy-castd is not installed yet."}'

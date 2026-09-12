@@ -1,0 +1,46 @@
+[package]
+name = "omarchy-castd"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "UniCast backend: cast local media to DLNA, Google Cast and AirPlay receivers"
+license = "MIT"
+repository = "https://github.com/liberuum/unicast"
+homepage = "https://github.com/liberuum/unicast"
+
+[dependencies]
+anyhow = "1.0.104"
+axum = "0.8.9"
+bytes = "1.12.1"
+http-body-util = "0.1.5"
+libc = "0.2.189"
+mdns-sd = "0.21.3"
+percent-encoding = "2.3.2"
+plist = "1.8.0"
+quick-xml = "0.42.0"
+rand = "0.10.2"
+reqwest = { version = "0.13.5", default-features = false, features = ["rustls"] }
+rust_cast = { version = "0.21.0", features = ["thread_safe"] }
+rustls = "0.23.44"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+socket2 = "0.6.5"
+thiserror = "2.0.20"
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "net", "process", "io-util", "time", "macros", "sync", "signal", "fs"] }
+tokio-util = { version = "0.7.19", features = ["io"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+url = "2.5.8"
+uuid = { version = "1.26.1", features = ["v4"] }
+zbus = { version = "5.19.0", default-features = false, features = ["tokio"] }
+
+[lints.rust]
+unsafe_code = "warn"
+
+[lints.clippy]
+all = "warn"
+pedantic = "warn"
+
+[profile.release]
+strip = true
+lto = "thin"

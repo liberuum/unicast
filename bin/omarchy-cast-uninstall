@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+# Remove everything omarchy-cast put on this machine outside the plugin folder:
+# the daemon binary, its systemd user unit, build cache, runtime state, and the
+# per-receiver ufw rules it added (each removal is authorized through polkit).
+#
+#   omarchy-cast-uninstall           keep ~/.config/omarchy/cast (settings)
+#   omarchy-cast-uninstall --purge   delete the settings too
+#
+# Afterwards remove the widget itself with:
+#   omarchy plugin remove universal-cast
+set -uo pipefail
+
+PURGE=0
+for arg in "$@"; do
+  case $arg in
+    --purge) PURGE=1 ;;
+    -h|--help) sed -n '2,/^set /p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) echo "omarchy-cast-uninstall: unknown option $arg" >&2; exit 2 ;;
+  esac
+done
+
+UNIT=omarchy-castd.service
+BIN=$HOME/.local/bin/omarchy-castd
+CONFIG=${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/cast
+UNIT_FILE=${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/$UNIT
+CACHE=${XDG_CACHE_HOME:-$HOME/.cache}/omarchy-cast
+RUNTIME=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/universal-cast
+
+say() { printf '\033[1momarchy-cast:\033[0m %s\n' "$*"; }
+
+# 1. Firewall rules: ask the daemon to delete the rules it recorded.
+if [[ -s $CONFIG/firewall-rules ]]; then
+  if [[ -x $BIN ]]; then
+    say "removing the ufw rules the daemon added (polkit will ask)"
+    "$BIN" --client clear-firewall >/dev/null 2>&1 || true
+  fi
+  if [[ -s $CONFIG/firewall-rules ]]; then
+    say "some ufw rules may remain; list them with: sudo ufw status | grep universal-cast"
+  fi
+fi
+
+# 2. Daemon and unit.
+if systemctl --user list-unit-files "$UNIT" >/dev/null 2>&1; then
+  systemctl --user disable --now "$UNIT" >/dev/null 2>&1 || true
+fi
+rm -f "$UNIT_FILE"
+systemctl --user daemon-reload >/dev/null 2>&1 || true
+pkill -x omarchy-castd >/dev/null 2>&1 || true
+say "stopped and removed $UNIT"
+
+# 3. Binary, build cache, runtime state.
+rm -f "$BIN"
+rm -rf "$CACHE" "$RUNTIME"
+say "removed $BIN, $CACHE and runtime state"
+
+# 4. Settings only on request.
+if (( PURGE )); then
+  rm -rf "$CONFIG"
+  say "removed settings in $CONFIG"
+else
+  say "kept settings in $CONFIG (use --purge to delete them)"
+fi
+
+say "now remove the widget: omarchy plugin remove universal-cast"

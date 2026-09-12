@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+# Portable checks for omarchy-cast: manifest contract, Rust format/lint/tests,
+# and a QML parse. Omarchy-only tools are used when present and skipped
+# otherwise, so this runs the same way on a developer machine and in CI.
+set -euo pipefail
+cd "$(dirname -- "$0")/.."
+
+step() { printf '\n\033[1m== %s\033[0m\n' "$*"; }
+
+step "manifest"
+jq -e '
+  .schemaVersion == 1
+  and .id == "universal-cast"
+  and (.name | length) > 0
+  and (.version | test("^[0-9]+\\.[0-9]+\\.[0-9]+"))
+  and (.kinds | index("bar-widget")) != null
+  and .entryPoints.barWidget == "BarWidget.qml"
+  and (.barWidget.defaultSection as $section | ["left","center","right"] | index($section)) != null
+' manifest.json >/dev/null
+test -f "$(jq -r .entryPoints.barWidget manifest.json)"
+test -f Panel.qml && test -f Model.js
+test "$(jq -r .version manifest.json)" = "$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)"/\1/')" \
+  || { echo "manifest.json and Cargo.toml versions differ" >&2; exit 1; }
+if [[ -n $(find . -path ./target -prune -o -path ./.git -prune -o -type l -print -quit) ]]; then
+  echo "symlinks are not allowed in a plugin" >&2; exit 1
+fi
+if command -v omarchy-plugin-validate >/dev/null; then
+  omarchy-plugin-validate .
+else
+  echo "omarchy-plugin-validate not available; skipped"
+fi
+
+step "qml parse"
+if command -v qmlformat >/dev/null; then
+  for file in *.qml; do qmlformat -n "$file" >/dev/null; done
+else
+  echo "qmlformat not available; skipped"
+fi
+
+step "shell scripts"
+bash -n bin/omarchy-cast bin/omarchy-cast-setup bin/omarchy-cast-uninstall
+test -x bin/omarchy-cast && test -x bin/omarchy-cast-setup && test -x bin/omarchy-cast-uninstall
+
+step "rust"
+cargo fmt --check
+cargo clippy --all-targets -- -D warnings
+cargo test
+
+echo
+echo "tests/run: OK"

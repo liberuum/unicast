@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+# Build and install the omarchy-cast backend (omarchy-castd) for the current user.
+#
+# - installs missing build/runtime packages with `omarchy pkg add` (it asks first)
+# - builds the daemon from this checkout into ~/.cache/omarchy-cast/target
+# - installs it to ~/.local/bin/omarchy-castd
+# - (re)starts the omarchy-castd.service user unit
+#
+# Safe to re-run after `omarchy plugin update`. Nothing needs root except the
+# package installs, which go through Omarchy's own package helper.
+set -euo pipefail
+
+HERE=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+CACHE=${XDG_CACHE_HOME:-$HOME/.cache}/omarchy-cast
+export CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-$CACHE/target}
+BIN_DIR=$HOME/.local/bin
+UNIT=omarchy-castd.service
+
+say() { printf '\033[1momarchy-cast:\033[0m %s\n' "$*"; }
+die() { printf 'omarchy-cast: %s\n' "$*" >&2; exit 1; }
+
+[[ -f $HERE/Cargo.toml && -d $HERE/src ]] || die "run this from the plugin checkout (Cargo.toml not found in $HERE)"
+
+missing=()
+command -v ffmpeg >/dev/null && command -v ffprobe >/dev/null || missing+=(ffmpeg)
+command -v cmake >/dev/null || missing+=(cmake)
+command -v cc >/dev/null || missing+=(base-devel)
+if ! command -v cargo >/dev/null; then
+  if command -v rustup >/dev/null; then
+    say "rustup is installed but no toolchain is active; installing stable"
+    rustup default stable
+  else
+    missing+=(rust)
+  fi
+fi
+if ((${#missing[@]})); then
+  say "installing missing packages: ${missing[*]}"
+  command -v omarchy >/dev/null || die "install ${missing[*]} with your package manager, then re-run"
+  omarchy pkg add "${missing[@]}"
+fi
+command -v cargo >/dev/null || die "cargo is still not available; open a new terminal and re-run"
+
+say "building omarchy-castd (this takes a minute or two the first time)"
+mkdir -p "$CACHE"
+(cd "$HERE" && cargo build --release --locked)
+
+install -Dm755 "$CARGO_TARGET_DIR/release/omarchy-castd" "$BIN_DIR/omarchy-castd"
+say "installed $BIN_DIR/omarchy-castd"
+
+if systemctl --user is-active --quiet "$UNIT" 2>/dev/null; then
+  systemctl --user restart "$UNIT"
+  say "restarted $UNIT onto the new binary"
+fi
+# The client installs and starts the user unit on first contact.
+if "$BIN_DIR/omarchy-castd" --client ping | grep -q '"ok": *true'; then
+  say "daemon is running ($UNIT)"
+else
+  die "the daemon did not answer; check: journalctl --user -u $UNIT"
+fi
+say "done. The Cast widget picks the backend up on its next status poll."

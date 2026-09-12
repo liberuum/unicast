@@ -1,0 +1,4 @@
+*.log
+
+# Added by cargo
+/target
