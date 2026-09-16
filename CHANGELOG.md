@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.1 — 2026-09-16
+
+- Pin an exact Rust toolchain (`rust-toolchain.toml`); `bin/omarchy-cast-setup`
+  now installs that release through rustup (checksum-verified against the
+  signed release manifests, `--no-self-update`) and builds the daemon with it,
+  instead of activating the mutable `stable` channel. CI builds with the same
+  pin and `tests/run` checks it cannot drift.
+
 ## 0.1.0 — 2026-09-12
 
 First public release of UniCast.

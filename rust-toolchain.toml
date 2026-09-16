@@ -1,0 +1,7 @@
+[toolchain]
+# Exact release this repository is built with, never a moving channel.
+# bin/omarchy-cast-setup installs this version through rustup (checksum-
+# verified against the signed release manifests) before building.
+channel = "1.98.1"
+profile = "minimal"
+components = ["rustfmt", "clippy"]

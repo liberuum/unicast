@@ -1,6 +1,6 @@
 # Maintainer: liberuum
 pkgname=omarchy-castd
-pkgver=0.1.0
+pkgver=0.1.1
 pkgrel=1
 pkgdesc="UniCast backend: cast local media to DLNA, Google Cast and AirPlay receivers"
 arch=('x86_64' 'aarch64')

@@ -30,6 +30,16 @@ else
   echo "omarchy-plugin-validate not available; skipped"
 fi
 
+step "rust toolchain pin"
+test -f rust-toolchain.toml
+PINNED=$(awk -F'"' '/^[[:space:]]*channel[[:space:]]*=/ {print $2; exit}' rust-toolchain.toml)
+[[ $PINNED =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+  || { echo "rust-toolchain.toml must pin an exact version, got '${PINNED:-none}'" >&2; exit 1; }
+if ! grep -Eq "toolchain:[[:space:]]*\"?$PINNED\"?" .github/workflows/ci.yml; then
+  echo "CI does not use the pinned toolchain $PINNED" >&2
+  exit 1
+fi
+
 step "qml parse"
 if command -v qmlformat >/dev/null; then
   for file in *.qml; do qmlformat -n "$file" >/dev/null; done

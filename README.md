@@ -32,13 +32,17 @@ live state and controls are instant.
 | ------------------------------------------------------------------------ | ------------------------------------------------------------------- |
 | Omarchy 4.0.x with the Omarchy shell (tested on 4.0.3, quickshell 0.3.1) | hosts the widget                                                    |
 | `ffmpeg` / `ffprobe` (standard on Omarchy)                               | media probing, subtitle conversion, audio boost                     |
-| Rust toolchain (≥ 1.85), `cmake` and a C compiler                        | to build `omarchy-castd` once                                       |
+| Rust 1.98.1 (pinned in `rust-toolchain.toml`; setup installs it via rustup), `cmake`, a C compiler | to build `omarchy-castd` once |
 | `systemd --user`                                                         | keeps the daemon running; without it the daemon is spawned directly |
 | optional: `ufw` + polkit                                                 | if `ufw` is enabled, a per-receiver rule opens the media port       |
 
 
 Rust crate dependencies are pinned in `Cargo.lock`; all are MIT/Apache-2.0
 licensed except `aws-lc-sys` (ISC/Apache-2.0/OpenSSL), pulled in by `rustls`.
+The compiler is pinned the same way: `rust-toolchain.toml` names one exact Rust
+release, `bin/omarchy-cast-setup` installs it through rustup only if it is
+missing (rustup verifies the download against the signed release manifests),
+and the build never uses a moving `stable` channel.
 
 ## Install
 
@@ -92,7 +96,8 @@ firewall rule below.
 - **Files written:** `~/.local/bin/omarchy-castd` (the daemon),
 `~/.config/systemd/user/omarchy-castd.service` (created on first use, enabled
 for your session), `~/.config/omarchy/cast/` (settings, manual receiver IPs,
-firewall ledger), `~/.cache/omarchy-cast/` (build output),
+firewall ledger), `~/.cache/omarchy-cast/` (build output), `~/.rustup/` (the
+pinned Rust toolchain, only when it has to be downloaded),
 `$XDG_RUNTIME_DIR/universal-cast/` (socket, subtitle cache). It never
 edits `shell.json` itself; placement goes through `omarchy plugin enable`.
 - **Processes:** `omarchy-castd` (daemon), `ffprobe` per cast, `ffmpeg` while a
@@ -212,6 +217,11 @@ flow through argv arrays with validation, never through a shell string, and
 are XML-escaped in DLNA metadata. Description fetches do not follow
 redirects and are size-capped; a device may only point its control URLs at
 itself over http(s).
+- The build toolchain is pinned to one exact Rust release
+  (`rust-toolchain.toml`); setup installs that version via rustup
+  (checksum-verified against the signed release manifests, never a moving
+  `stable` channel) and builds with `--locked`, so the same plugin commit
+  always compiles with the same compiler and the same checksummed crates.
 - Private runtime and config state is owner-only (mode 0700; socket 0600).
 - The widget runs unsandboxed inside the Omarchy shell like every plugin;
 review the code before enabling it. See [SECURITY.md](SECURITY.md) for how to
@@ -231,6 +241,9 @@ receiver request and ffmpeg command line.
 tests/run                      # manifest check, cargo fmt/clippy/test, QML parse
 cargo build --release
 ```
+
+Both use the Rust version pinned in `rust-toolchain.toml` automatically when
+rustup manages `cargo`; `tests/run` also fails if the pin and CI drift apart.
 
 The wire contract is newline-delimited JSON over
 `$XDG_RUNTIME_DIR/universal-cast/castd.sock`; `bin/omarchy-cast` forwards

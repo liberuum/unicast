@@ -2,12 +2,17 @@
 # Build and install the omarchy-cast backend (omarchy-castd) for the current user.
 #
 # - installs missing build/runtime packages with `omarchy pkg add` (it asks first)
-# - builds the daemon from this checkout into ~/.cache/omarchy-cast/target
+# - builds the daemon with the exact Rust version pinned in rust-toolchain.toml
 # - installs it to ~/.local/bin/omarchy-castd
 # - (re)starts the omarchy-castd.service user unit
 #
 # Safe to re-run after `omarchy plugin update`. Nothing needs root except the
 # package installs, which go through Omarchy's own package helper.
+#
+# The pin is an exact release, never a moving channel, so a given plugin commit
+# always compiles with the same compiler. rustup downloads that release only if
+# it is missing and verifies it against the signed release manifests; the crate
+# graph is pinned and checksummed by Cargo.lock.
 set -euo pipefail
 
 HERE=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
@@ -21,28 +26,49 @@ die() { printf 'omarchy-cast: %s\n' "$*" >&2; exit 1; }
 
 [[ -f $HERE/Cargo.toml && -d $HERE/src ]] || die "run this from the plugin checkout (Cargo.toml not found in $HERE)"
 
+# Exact Rust release this checkout builds with, from rust-toolchain.toml.
+PINNED=$(awk -F'"' '/^[[:space:]]*channel[[:space:]]*=/ {print $2; exit}' "$HERE/rust-toolchain.toml" 2>/dev/null)
+[[ ${PINNED:-} =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "rust-toolchain.toml must pin an exact version like 1.98.1 (got '${PINNED:-none}')"
+
 missing=()
 command -v ffmpeg >/dev/null && command -v ffprobe >/dev/null || missing+=(ffmpeg)
 command -v cmake >/dev/null || missing+=(cmake)
 command -v cc >/dev/null || missing+=(base-devel)
-if ! command -v cargo >/dev/null; then
-  if command -v rustup >/dev/null; then
-    say "rustup is installed but no toolchain is active; installing stable"
-    rustup default stable
-  else
-    missing+=(rust)
+system_cargo_matches() {
+  command -v cargo >/dev/null && [[ $(cargo --version 2>/dev/null | awk '{print $2}') == "$PINNED" ]]
+}
+if ! command -v rustup >/dev/null && ! system_cargo_matches; then
+  if command -v cargo >/dev/null; then
+    say "system cargo $(cargo --version | awk '{print $2}') does not match the pinned Rust $PINNED; installing rustup to provide it"
   fi
+  missing+=(rustup)
 fi
 if ((${#missing[@]})); then
   say "installing missing packages: ${missing[*]}"
   command -v omarchy >/dev/null || die "install ${missing[*]} with your package manager, then re-run"
-  omarchy pkg add "${missing[@]}"
+  omarchy pkg add "${missing[@]}" \
+    || die "installing ${missing[*]} failed; if rustup conflicts with the distro rust package, remove it (sudo pacman -Rns rust) and re-run"
 fi
-command -v cargo >/dev/null || die "cargo is still not available; open a new terminal and re-run"
+command -v rustup >/dev/null || command -v cargo >/dev/null \
+  || die "no Rust toolchain is available; open a new terminal and re-run"
 
-say "building omarchy-castd (this takes a minute or two the first time)"
+if command -v rustup >/dev/null; then
+  if ! rustup toolchain list 2>/dev/null | cut -d' ' -f1 | grep -Eq "^${PINNED}(-|$)"; then
+    say "installing Rust $PINNED (checksum-verified against the signed release manifests)"
+    rustup toolchain install "$PINNED" --profile minimal \
+      --component rustfmt --component clippy --no-self-update
+  fi
+  export RUSTUP_TOOLCHAIN="$PINNED"
+  cargo_cmd=(rustup run "$PINNED" cargo)
+elif system_cargo_matches; then
+  cargo_cmd=(cargo)
+else
+  die "cargo $(cargo --version 2>/dev/null | awk '{print $2}') does not match the pinned Rust $PINNED; install rustup (omarchy pkg add rustup), open a new terminal and re-run"
+fi
+
+say "building omarchy-castd with Rust $PINNED (this takes a minute or two the first time)"
 mkdir -p "$CACHE"
-(cd "$HERE" && cargo build --release --locked)
+(cd "$HERE" && "${cargo_cmd[@]}" build --release --locked)
 
 install -Dm755 "$CARGO_TARGET_DIR/release/omarchy-castd" "$BIN_DIR/omarchy-castd"
 say "installed $BIN_DIR/omarchy-castd"

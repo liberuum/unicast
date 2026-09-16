@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "universal-cast",
   "name": "UniCast",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "author": "liberuum",
   "license": "MIT",
   "description": "Discover any Wi-Fi TV or receiver and cast local media (or the file your player is playing) to it over DLNA, Google Cast, or AirPlay, with volume, audio boost and subtitles.",
