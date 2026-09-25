@@ -40,6 +40,16 @@ if ! grep -Eq "toolchain:[[:space:]]*\"?$PINNED\"?" .github/workflows/ci.yml; th
   exit 1
 fi
 
+step "workflow action pins"
+if grep -EHn '^[[:space:]-]*uses:' .github/workflows/*.yml | grep -Ev 'uses:[[:space:]]*[^@[:space:]]+@[0-9a-f]{40}([[:space:]]|$)'; then
+  echo "every workflow 'uses:' must pin a full 40-character commit SHA" >&2
+  exit 1
+fi
+grep -q 'persist-credentials: false' .github/workflows/ci.yml \
+  || { echo "actions/checkout must set persist-credentials: false" >&2; exit 1; }
+grep -Eq '^permissions:' .github/workflows/ci.yml \
+  || { echo "CI must declare minimal workflow permissions" >&2; exit 1; }
+
 step "qml parse"
 if command -v qmlformat >/dev/null; then
   for file in *.qml; do qmlformat -n "$file" >/dev/null; done

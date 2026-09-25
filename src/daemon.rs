@@ -5,7 +5,7 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Mutex, mpsc};
 
@@ -22,6 +22,18 @@ use crate::settings;
 use crate::state::{Session, SessionState};
 use crate::subtitles::{self, SubtitleTrack};
 use crate::util;
+
+/// Consecutive failed status polls (one per second) before a DLNA renderer
+/// counts as gone.
+const POLL_UNREACHABLE_LIMIT: u32 = 20;
+/// How long a receiver may take to report playback before the cast fails.
+const START_GRACE: Duration = Duration::from_secs(60);
+/// Longest single request line accepted on the control socket.
+const MAX_REQUEST_BYTES: u64 = 64 * 1024;
+/// How long a client may take to send its request line.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+/// Upper bound on the receiver teardown at daemon exit.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(3);
 
 pub enum Event {
     SessionEnded { session_id: u64 },
@@ -716,34 +728,53 @@ impl Daemon {
         self.status()
     }
 
-    async fn disconnect_locked(&self) {
+    /// Tears the active session down. The receiver stop requests run in the
+    /// background so a switched-off TV cannot stall the panel; the returned
+    /// handles let `shutdown` wait for them before the process exits.
+    async fn disconnect_locked(&self) -> Vec<tokio::task::JoinHandle<()>> {
+        let mut pending = Vec::new();
         let mut active = self.active.lock().await;
         active.serve = None;
         if let Some(dlna) = active.dlna.take() {
             dlna.poller.abort();
             let control = dlna.control_url.clone();
-            tokio::spawn(async move {
+            pending.push(tokio::spawn(async move {
                 dlna::stop(&control).await;
-            });
+            }));
         }
         if let Some(cast) = active.cast.take() {
             cast.shutdown();
         }
         if let Some(airplay) = active.airplay.take() {
             airplay.poller.abort();
-            tokio::spawn(async move {
+            pending.push(tokio::spawn(async move {
                 airplay::stop(&airplay.ip, airplay.port).await;
-            });
+            }));
         }
         if let Some(server) = active.media.take() {
             server.stop().await;
         }
+        pending
     }
 
     fn reset_session(&self) {
         if let Ok(mut session) = self.state.write() {
             *session = Session::default();
         }
+    }
+
+    /// Marks the active session failed with `message` and lets `auto_stop`
+    /// tear down the receiver connection and the media server.
+    fn fail_session(&self, message: &str) {
+        let session_id = match self.state.write() {
+            Ok(mut session) if session.state.is_active() => {
+                session.state = SessionState::Error;
+                session.error = message.to_string();
+                session.session_id
+            }
+            _ => return,
+        };
+        let _ = self.events.send(Event::SessionEnded { session_id });
     }
 
     async fn pause(self: &Arc<Self>) -> Value {
@@ -1057,6 +1088,16 @@ impl Daemon {
     /// Rebuilds the media server for the active session with `boost` and points
     /// the receiver at the new stream, resuming at `position`.
     async fn restream(&self, boost: i32, position: f64) -> Result<(), String> {
+        let result = self.restream_inner(boost, position).await;
+        // The old stream is already gone at this point: a half-rebuilt session
+        // must end instead of claiming to play.
+        if let Err(error) = &result {
+            self.fail_session(&format!("Could not restart the stream: {error}"));
+        }
+        result
+    }
+
+    async fn restream_inner(&self, boost: i32, position: f64) -> Result<(), String> {
         let context = {
             let active = self.active.lock().await;
             // The pollers must not mistake the stream swap for the end of playback.
@@ -1164,7 +1205,11 @@ impl Daemon {
             session.position = position;
             session.state = SessionState::Buffering;
         }
-        result.map_err(|error| format!("Receiver rejected the stream: {error}"))
+        let result = result.map_err(|error| format!("Receiver rejected the stream: {error}"));
+        if let Err(error) = &result {
+            self.fail_session(error);
+        }
+        result
     }
 
     /// `AirPlay` counterpart of [`Self::restart_dlna`].
@@ -1215,6 +1260,9 @@ impl Daemon {
         if let Ok(mut session) = self.state.write() {
             session.position = position;
             session.state = SessionState::Buffering;
+        }
+        if let Err(error) = &result {
+            self.fail_session(&format!("Receiver rejected the stream: {error}"));
         }
         result
     }
@@ -1275,7 +1323,21 @@ impl Daemon {
     }
 
     async fn shutdown(&self) {
-        self.disconnect_locked().await;
+        let _action = self.action.lock().await;
+        let had_cast = self.active.lock().await.cast.is_some();
+        let pending = self.disconnect_locked().await;
+        // Give the receiver a moment to hear the stop before the process (and
+        // the cast thread with it) goes away; otherwise the TV keeps playing
+        // or shows an error from the vanished media server.
+        let _ = tokio::time::timeout(SHUTDOWN_GRACE, async {
+            for handle in pending {
+                let _ = handle.await;
+            }
+            if had_cast {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        })
+        .await;
         let _ = std::fs::remove_file(util::socket_path());
         std::process::exit(0);
     }
@@ -1293,6 +1355,8 @@ async fn dlna_poll(
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut seen_active = false;
     let mut ticks = 0_u32;
+    let mut unreachable = 0_u32;
+    let started = Instant::now();
     loop {
         ticker.tick().await;
         {
@@ -1338,6 +1402,22 @@ async fn dlna_poll(
                 }
                 _ => {}
             }
+            // A renderer that went away (switched off, left the network) or
+            // never started playing must not leave the session hanging.
+            unreachable = if transport == "UNKNOWN" {
+                unreachable + 1
+            } else {
+                0
+            };
+            if !ended && unreachable >= POLL_UNREACHABLE_LIMIT {
+                session.state = SessionState::Error;
+                session.error = "Lost the connection to the receiver.".to_string();
+                ended = true;
+            } else if !ended && !seen_active && started.elapsed() >= START_GRACE {
+                session.state = SessionState::Error;
+                session.error = "The receiver did not start playing.".to_string();
+                ended = true;
+            }
             // An ffmpeg stream has no known length on the renderer side; keep
             // the probed duration then.
             if let Some(duration) = duration
@@ -1373,6 +1453,7 @@ async fn airplay_poll(
     let mut ticker = tokio::time::interval(Duration::from_secs(1));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut seen_active = false;
+    let started = Instant::now();
     loop {
         ticker.tick().await;
         {
@@ -1409,6 +1490,11 @@ async fn airplay_poll(
                     session.state = SessionState::Stopped;
                     ended = true;
                 }
+                None if started.elapsed() >= START_GRACE => {
+                    session.state = SessionState::Error;
+                    session.error = "The receiver did not start playing.".to_string();
+                    ended = true;
+                }
                 None => {}
             }
         }
@@ -1421,9 +1507,12 @@ async fn airplay_poll(
 
 async fn handle_connection(daemon: Arc<Daemon>, stream: UnixStream) {
     let (reader, mut writer) = stream.into_split();
-    let mut lines = BufReader::new(reader).lines();
-    let response = match lines.next_line().await {
-        Ok(Some(line)) => match serde_json::from_str::<Request>(&line) {
+    // One bounded line per connection: a silent or runaway client must not pin
+    // a task or grow a buffer without limit.
+    let mut lines = BufReader::new(reader.take(MAX_REQUEST_BYTES)).lines();
+    let request = tokio::time::timeout(REQUEST_TIMEOUT, lines.next_line()).await;
+    let response = match request {
+        Ok(Ok(Some(line))) => match serde_json::from_str::<Request>(&line) {
             Ok(request) => daemon.dispatch(&request).await,
             Err(_) => error_response("bad request"),
         },
@@ -1479,6 +1568,9 @@ pub fn main() {
         return;
     }
     let _ = std::fs::remove_file(util::socket_path());
+    // Converted subtitles of sessions a previous daemon never tore down (killed,
+    // crashed); we hold the lock, so nothing else is using them.
+    let _ = std::fs::remove_dir_all(util::state_dir().join("subtitles"));
     let (events_tx, mut events_rx) = mpsc::unbounded_channel();
     let daemon = Arc::new(Daemon::new(events_tx));
     let runtime = match tokio::runtime::Builder::new_multi_thread()
@@ -1501,6 +1593,24 @@ pub fn main() {
                     }
                 }
             }
+        });
+        // `systemctl --user stop` sends SIGTERM: stop the receiver cleanly
+        // instead of leaving the TV pointed at a dead stream.
+        let on_signal = Arc::clone(&daemon);
+        tokio::spawn(async move {
+            use tokio::signal::unix::{SignalKind, signal};
+            let (Ok(mut term), Ok(mut int)) = (
+                signal(SignalKind::terminate()),
+                signal(SignalKind::interrupt()),
+            ) else {
+                tracing::warn!("could not install signal handlers");
+                return;
+            };
+            tokio::select! {
+                _ = term.recv() => {}
+                _ = int.recv() => {}
+            }
+            on_signal.shutdown().await;
         });
         if let Err(error) = run_socket_server(daemon).await {
             tracing::error!("daemon stopped: {error}");

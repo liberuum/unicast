@@ -48,13 +48,17 @@ fn collect_locations(socket: &UdpSocket, window: Duration) -> HashSet<String> {
     let mut buffer = [0_u8; 4096];
     while Instant::now() < deadline {
         match socket.recv_from(&mut buffer) {
-            Ok((len, _)) => {
+            Ok((len, from)) => {
                 let text = String::from_utf8_lossy(&buffer[..len]);
+                let sender = from.ip().to_string();
                 for line in text.split("\r\n") {
                     if line.to_ascii_lowercase().starts_with("location:") {
                         if let Some((_, value)) = line.split_once(':') {
                             let value = value.trim().to_string();
-                            if !value.is_empty() {
+                            // A device describes itself: a Location pointing
+                            // anywhere but the replying host (localhost, a
+                            // router admin page) is dropped.
+                            if !value.is_empty() && host_of(&value).as_deref() == Some(&sender) {
                                 locations.insert(value);
                             }
                         }
@@ -121,14 +125,23 @@ fn client() -> &'static reqwest::Client {
 const MAX_DESCRIPTION_BYTES: u64 = 1024 * 1024;
 
 async fn http_get_text(url: &str, timeout: Duration) -> Option<String> {
-    let response = client().get(url).timeout(timeout).send().await.ok()?;
+    let mut response = client().get(url).timeout(timeout).send().await.ok()?;
     if response
         .content_length()
         .is_some_and(|length| length > MAX_DESCRIPTION_BYTES)
     {
         return None;
     }
-    response.text().await.ok()
+    // Content-Length is optional (chunked replies), so enforce the cap while
+    // reading as well.
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.ok()? {
+        body.extend_from_slice(&chunk);
+        if body.len() as u64 > MAX_DESCRIPTION_BYTES {
+            return None;
+        }
+    }
+    Some(String::from_utf8_lossy(&body).into_owned())
 }
 
 pub async fn discover(
@@ -280,7 +293,6 @@ pub struct Description {
 #[allow(clippy::map_unwrap_or)]
 pub fn parse_description(xml: &str, location: &str) -> Description {
     let mut reader = Reader::from_str(xml);
-    reader.config_mut().trim_text(true);
     let mut buffer = Vec::new();
     let mut url_base: Option<String> = None;
     let mut friendly: Option<String> = None;
@@ -291,6 +303,9 @@ pub fn parse_description(xml: &str, location: &str) -> Description {
     let mut service_type = String::new();
     let mut service_control = String::new();
     let mut current = String::new();
+    // quick-xml reports `&amp;` and `&#..;` as separate events between text
+    // chunks, so an element's text is accumulated and only used at its end.
+    let mut text = String::new();
     loop {
         match reader.read_event_into(&mut buffer) {
             Ok(Event::Start(event)) => {
@@ -301,23 +316,40 @@ pub fn parse_description(xml: &str, location: &str) -> Description {
                     service_control.clear();
                 }
                 current = name;
+                text.clear();
             }
             Ok(Event::Text(event)) => {
                 let raw = event.into_inner();
-                let text = quick_xml::escape::unescape(&raw)
-                    .map(std::borrow::Cow::into_owned)
-                    .unwrap_or_else(|_| raw.into_owned());
-                match current.as_str() {
-                    "URLBase" => url_base = Some(text),
-                    "friendlyName" if !in_service => friendly = Some(text),
-                    "modelName" if !in_service => model = Some(text),
-                    "serviceType" if in_service => service_type = text,
-                    "controlURL" if in_service => service_control = text,
-                    _ => {}
+                match quick_xml::escape::unescape(&raw) {
+                    Ok(chunk) => text.push_str(&chunk),
+                    Err(_) => text.push_str(&raw),
+                }
+            }
+            Ok(Event::CData(event)) => text.push_str(&event),
+            Ok(Event::GeneralRef(event)) => {
+                let resolved = match event.resolve_char_ref() {
+                    Ok(Some(character)) => Some(character.to_string()),
+                    _ => quick_xml::escape::resolve_predefined_entity(&event).map(str::to_string),
+                };
+                if let Some(resolved) = resolved {
+                    text.push_str(&resolved);
                 }
             }
             Ok(Event::End(event)) => {
                 let name = local_name(event.name().as_ref());
+                let value = text.trim().to_string();
+                if name == current && !value.is_empty() {
+                    match current.as_str() {
+                        "URLBase" => url_base = Some(value),
+                        "friendlyName" if !in_service && friendly.is_none() => {
+                            friendly = Some(value);
+                        }
+                        "modelName" if !in_service && model.is_none() => model = Some(value),
+                        "serviceType" if in_service => service_type = value,
+                        "controlURL" if in_service => service_control = value,
+                        _ => {}
+                    }
+                }
                 if name == "service" {
                     if control.is_none()
                         && service_type.contains("AVTransport")
@@ -334,6 +366,7 @@ pub fn parse_description(xml: &str, location: &str) -> Description {
                     in_service = false;
                 }
                 current.clear();
+                text.clear();
             }
             Ok(Event::Eof) | Err(_) => break,
             _ => {}
@@ -587,6 +620,25 @@ mod tests {
             Some("http://10.0.0.5:8080/dmr/ctl/AVTransport")
         );
         assert_eq!(description.rendering, None);
+    }
+
+    #[test]
+    fn entities_in_names_and_urls() {
+        let xml = r"<root><device>
+            <friendlyName>Tom &amp; Jerry&#39;s TV</friendlyName>
+            <modelName>Model &lt;X&gt;</modelName>
+            <serviceList><service>
+              <serviceType>urn:schemas-upnp-org:service:AVTransport:1</serviceType>
+              <controlURL>/ctl?a=1&amp;b=2</controlURL>
+            </service></serviceList>
+        </device></root>";
+        let description = parse_description(xml, "http://10.0.0.5:8080/desc.xml");
+        assert_eq!(description.friendly.as_deref(), Some("Tom & Jerry's TV"));
+        assert_eq!(description.model.as_deref(), Some("Model <X>"));
+        assert_eq!(
+            description.control.as_deref(),
+            Some("http://10.0.0.5:8080/ctl?a=1&b=2")
+        );
     }
 
     #[test]

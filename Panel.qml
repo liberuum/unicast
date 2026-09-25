@@ -28,6 +28,11 @@ Panel {
   property string connectedIp: ""
   property string lastReceiver: ""
   property string errorText: ""
+  // True while errorText is a "service unavailable" message from a status
+  // poll, which the next healthy poll may clear (action errors stay put).
+  property bool pollErrorShown: false
+  // An IP typed while a scan was running; sent once the scan returns.
+  property string pendingManualIp: ""
   property var devices: []
   property bool showSettings: false
   property bool scanning: false
@@ -115,10 +120,11 @@ Panel {
     return false
   }
   function run(process, args) {
-    if (process.running) return
+    if (process.running) return false
     if (process === actionProc) actionVerb = args[0] || ""
     process.command = [helper].concat(args)
     process.running = true
+    return true
   }
   function safeRemoteText(value, maximumLength) {
     return Model.safeRemoteText(value, maximumLength)
@@ -157,14 +163,20 @@ Panel {
   function isBackendMissing(message) {
     return /not installed/i.test(String(message || ""))
   }
-  function applyStatus(raw) {
+  function applyStatus(raw, fromPoll) {
     var data = Model.parseJson(raw, { ok: false, error: "Invalid response" })
     if (!data.ok) {
       if (isBackendMissing(data.error)) { backendProbed = true; backendInstalled = false; return }
-      errorText = data.error || "Cast status unavailable"; return
+      errorText = data.error || "Cast status unavailable"
+      pollErrorShown = fromPoll === true
+      return
     }
     backendProbed = true
     backendInstalled = true
+    // The daemon answers again (e.g. after the setup script restarted it):
+    // drop the "service unavailable" message the failed poll left behind.
+    if (fromPoll === true && pollErrorShown && !data.error) errorText = ""
+    pollErrorShown = false
     // Only set an error here; never clear one a just-finished action set (a
     // periodic status poll must not wipe it). Errors clear on the next action.
     if (data.error) errorText = data.error
@@ -231,7 +243,9 @@ Panel {
     run(actionProc, [paused ? "resume" : "pause"])
   }
   function connectReceiver(ip) {
-    if (!ip || busy) return
+    // Bail before touching any state: a dropped run() would otherwise leave
+    // the panel showing "Connecting…" for a request that was never sent.
+    if (!ip || busy || actionProc.running) return
     errorText = ""
     busy = true
     var target = null
@@ -299,14 +313,18 @@ Panel {
     else errorText = "Choose a device first"
   }
   function addManualIp(ip) {
+    ip = String(ip || "").trim()
     if (!ip) return
     errorText = ""
     scanning = true
     // add-ip returns the discover-shaped {ok,devices}, so it must be applied by
-    // applyDevices (via discoverProc), not applyStatus.
-    run(discoverProc, ["add-ip", ip])
+    // applyDevices (via discoverProc), not applyStatus. A scan in flight
+    // holds discoverProc: queue the address instead of dropping it.
+    if (!run(discoverProc, ["add-ip", ip])) pendingManualIp = ip
   }
-  function saveMulticast(enabled) { run(actionProc, ["save-multicast", enabled ? "true" : "false"]) }
+  // Its own process: a long connect or boost change on actionProc must not
+  // swallow the toggle.
+  function saveMulticast(enabled) { run(settingsProc, ["save-multicast", enabled ? "true" : "false"]) }
   function moveCursor(dx, dy) {
     cursorActive = true
     if (dy !== 0) {
@@ -375,7 +393,7 @@ Panel {
   Process {
     id: statusProc
     stdout: StdioCollector { id: statusOut }
-    onExited: root.applyStatus(statusOut.text)
+    onExited: root.applyStatus(statusOut.text, true)
   }
   Process {
     id: discoverProc
@@ -383,7 +401,17 @@ Panel {
     onExited: {
       root.scanning = false
       root.applyDevices(discoverOut.text)
+      if (root.pendingManualIp !== "") {
+        var ip = root.pendingManualIp
+        root.pendingManualIp = ""
+        Qt.callLater(function() { root.addManualIp(ip) })
+      }
     }
+  }
+  Process {
+    id: settingsProc
+    stdout: StdioCollector { id: settingsOut }
+    onExited: root.applyStatus(settingsOut.text)
   }
   Process {
     id: actionProc
@@ -620,13 +648,19 @@ Panel {
               spacing: Style.space(8)
               Text { Layout.fillWidth: true; text: "Subtitles"; color: root.foreground; font.family: root.fontFamily; font.pixelSize: Style.font.body }
               Dropdown {
+                id: subtitleDropdown
                 showLabel: false
                 opacity: root.actionVerb === "set-subtitle" ? 0.6 : 1.0
                 options: root.subtitleOptions
                 value: root.subtitle >= 0 ? String(root.subtitle) : "off"
                 foreground: root.foreground
                 fontFamily: root.fontFamily
-                onChanged: function(v) { root.setSubtitle(v) }
+                onChanged: function(v) {
+                  root.setSubtitle(v)
+                  // Selecting assigns `value`, which breaks the binding above;
+                  // restore it so the dropdown keeps following the daemon.
+                  subtitleDropdown.value = Qt.binding(function() { return root.subtitle >= 0 ? String(root.subtitle) : "off" })
+                }
               }
             }
             RowLayout {
@@ -879,7 +913,9 @@ Panel {
         CastIcon {
           anchors.fill: parent
           visible: root.deviceKind(receiver) === "chromecast"
-          foreground: active ? root.foreground : root.dim
+          // Qualified: a bare `active` would resolve to CastIcon's own property.
+          active: receiverRow.active
+          foreground: receiverRow.active ? root.foreground : root.dim
         }
       }
       Column {

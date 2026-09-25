@@ -9,7 +9,10 @@ use serde_json::{Value, json};
 use crate::util;
 
 const UNIT_NAME: &str = "omarchy-castd.service";
-const SEND_TIMEOUT: Duration = Duration::from_secs(95);
+/// Longer than the slowest `connect`: probing, a polkit prompt for the
+/// firewall rule (up to 60 s) and two Cast attempts (25 s each). Giving up
+/// earlier reports an error while the daemon goes on and casts anyway.
+const SEND_TIMEOUT: Duration = Duration::from_secs(150);
 
 pub fn ping_sync(timeout: Duration) -> bool {
     let Ok(mut stream) = UnixStream::connect(util::socket_path()) else {

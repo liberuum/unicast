@@ -39,7 +39,12 @@ if [[ -s $CONFIG/firewall-rules ]]; then
   fi
 fi
 
-# 2. Daemon and unit.
+# 2. Daemon and unit. The binaries go first (the installed one and the build
+# cache that bin/omarchy-cast falls back to): a status poll from the still
+# loaded widget would otherwise respawn the daemon and rewrite the unit file
+# between the stop and the removal below.
+rm -f "$BIN"
+rm -rf "$CACHE"
 if systemctl --user list-unit-files "$UNIT" >/dev/null 2>&1; then
   systemctl --user disable --now "$UNIT" >/dev/null 2>&1 || true
 fi
@@ -48,9 +53,8 @@ systemctl --user daemon-reload >/dev/null 2>&1 || true
 pkill -x omarchy-castd >/dev/null 2>&1 || true
 say "stopped and removed $UNIT"
 
-# 3. Binary, build cache, runtime state.
-rm -f "$BIN"
-rm -rf "$CACHE" "$RUNTIME"
+# 3. Runtime state.
+rm -rf "$RUNTIME"
 say "removed $BIN, $CACHE and runtime state"
 
 # 4. Settings only on request.

@@ -300,6 +300,18 @@ pub fn discover(media: &Path) -> Vec<SubtitleTrack> {
     tracks
 }
 
+/// Longest a single subtitle conversion may take (an embedded track in a large
+/// MKV on slow storage is the slow case).
+const CONVERT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Whether `path` is valid UTF-8 (a BOM is fine). Unreadable files count as
+/// UTF-8 so ffmpeg gets to report the real error.
+async fn is_utf8_file(path: &Path) -> bool {
+    tokio::fs::read(path)
+        .await
+        .map_or(true, |bytes| std::str::from_utf8(&bytes).is_ok())
+}
+
 /// Path of the `WebVTT` file for `track`, converting it into `dir` on first use.
 pub async fn ensure_vtt(
     track: &SubtitleTrack,
@@ -315,9 +327,13 @@ pub async fn ensure_vtt(
         .map_err(|error| format!("cannot create subtitle cache: {error}"))?;
     let part = dir.join(format!("{}.vtt.part", track.id));
     let attempts: Vec<Vec<String>> = match &track.source {
+        // Older .srt files are often Latin-1. ffmpeg does not fail on them, it
+        // silently drops every line with invalid UTF-8, so decide up front.
+        SubtitleSource::Sidecar(path) if !is_utf8_file(path).await => {
+            vec![ffmpeg_args(path, None, Some("ISO-8859-1"))]
+        }
         SubtitleSource::Sidecar(path) => vec![
             ffmpeg_args(path, None, None),
-            // Older .srt files are often Latin-1; ffmpeg rejects them as invalid UTF-8.
             ffmpeg_args(path, None, Some("ISO-8859-1")),
         ],
         SubtitleSource::Embedded { stream_index } => {
@@ -326,15 +342,21 @@ pub async fn ensure_vtt(
     };
     for args in attempts {
         let _ = tokio::fs::remove_file(&part).await;
-        let status = tokio::process::Command::new("ffmpeg")
-            .args(&args)
-            .arg(&part)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .await;
-        if status.is_ok_and(|status| status.success())
+        // Bounded, and killed if the request that asked for it goes away, so a
+        // stuck extraction never outlives the lock that serialises conversions.
+        let status = tokio::time::timeout(
+            CONVERT_TIMEOUT,
+            tokio::process::Command::new("ffmpeg")
+                .args(&args)
+                .arg(&part)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .kill_on_drop(true)
+                .status(),
+        )
+        .await;
+        if status.is_ok_and(|status| status.is_ok_and(|status| status.success()))
             && tokio::fs::metadata(&part)
                 .await
                 .is_ok_and(|meta| meta.len() > 0)

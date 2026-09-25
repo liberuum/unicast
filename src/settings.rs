@@ -1,6 +1,8 @@
 use std::collections::BTreeSet;
 use std::fs;
+use std::io::Write;
 use std::path::Path;
+use std::sync::Mutex;
 
 use crate::util;
 
@@ -12,7 +14,30 @@ pub fn get(key: &str, default: &str) -> String {
         .unwrap_or_else(|| default.to_string())
 }
 
+/// Serialises every settings/ledger write in the daemon, so two concurrent
+/// read-modify-write cycles cannot drop each other's keys.
+static WRITE_LOCK: Mutex<()> = Mutex::new(());
+
+/// Replaces `path` atomically: write a sibling temp file, fsync, rename. A crash
+/// leaves either the old or the new contents, never a truncated file.
+fn write_atomic(path: &Path, body: &str) -> std::io::Result<()> {
+    let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
+    let result = (|| {
+        let mut file = fs::File::create(&tmp)?;
+        file.write_all(body.as_bytes())?;
+        file.sync_all()?;
+        fs::rename(&tmp, path)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    result
+}
+
 pub fn set(key: &str, value: &str) -> std::io::Result<()> {
+    let _guard = WRITE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     util::ensure_dirs();
     let mut data = fs::read_to_string(util::settings_file())
         .ok()
@@ -24,9 +49,7 @@ pub fn set(key: &str, value: &str) -> std::io::Result<()> {
         serde_json::Value::String(value.to_string()),
     );
     let text = serde_json::to_string(&data).unwrap_or_else(|_| "{}".to_string());
-    let tmp = util::settings_file().with_extension("json.tmp");
-    fs::write(&tmp, text)?;
-    fs::rename(tmp, util::settings_file())
+    write_atomic(&util::settings_file(), &text)
 }
 
 pub fn multicast_discovery() -> bool {
@@ -60,10 +83,13 @@ pub fn manual_ips() -> Vec<String> {
 }
 
 pub fn write_manual_ips(ips: &[String]) {
+    let _guard = WRITE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     util::ensure_dirs();
     let body = ips.join("\n");
     let body = if body.is_empty() { body } else { body + "\n" };
-    let _ = fs::write(util::manual_ips_file(), body);
+    let _ = write_atomic(&util::manual_ips_file(), &body);
 }
 
 pub fn firewall_ledger() -> BTreeSet<String> {
@@ -71,12 +97,15 @@ pub fn firewall_ledger() -> BTreeSet<String> {
 }
 
 pub fn write_firewall_ledger(ips: &BTreeSet<String>) {
+    let _guard = WRITE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     util::ensure_dirs();
     let mut body = ips.iter().cloned().collect::<Vec<_>>().join("\n");
     if !body.is_empty() {
         body.push('\n');
     }
-    let _ = fs::write(util::firewall_ledger(), body);
+    let _ = write_atomic(&util::firewall_ledger(), &body);
 }
 
 fn read_lines(path: &Path) -> Vec<String> {

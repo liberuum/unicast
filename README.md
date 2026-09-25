@@ -1,258 +1,298 @@
-# UniCast
+<p align="center">
+  <img src="assets/banner.png" alt="UniCast: cast local video to any TV, straight from the Omarchy bar" width="100%">
+</p>
 
-UniCast casts a local video to the TV on the [Omarchy](https://omarchy.org) bar.
-Discover any Wi-Fi TV or receiver on your network and cast a local file, or the
-file your media player is playing, over **DLNA**, **Google Cast** or
-**AirPlay**. The receiver fetches and decodes the media itself, so unlike screen
-mirroring the laptop stays free, cool and silent, and high-bitrate or HEVC
-content plays smoothly.
+<p align="center">
+  <a href="https://github.com/liberuum/unicast/actions/workflows/ci.yml"><img src="https://github.com/liberuum/unicast/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <img src="https://img.shields.io/badge/Omarchy-4.0-81a1c1" alt="Omarchy 4.0">
+  <img src="https://img.shields.io/badge/Rust-1.98.1-a3be8c" alt="Rust 1.98.1">
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-b48ead" alt="MIT license"></a>
+</p>
 
-![UniCast panel](preview.png)
+<p align="center">
+  <a href="#install">Install</a> ·
+  <a href="#usage">Usage</a> ·
+  <a href="#supported-receivers">Receivers</a> ·
+  <a href="#how-it-works">How it works</a> ·
+  <a href="#troubleshooting">Troubleshooting</a> ·
+  <a href="#security">Security</a>
+</p>
 
-While casting, the panel offers pause/resume, seeking, the receiver's **volume**
-and mute, an **audio boost** for quiet movie mixes, and **subtitles** on Google
-Cast receivers.
+---
 
-![Panel during Play](assets/playing.png)
+**UniCast** is an [Omarchy](https://omarchy.org) bar widget that sends a local
+video to your TV. Pick a file, or keep watching what VLC or mpv is already
+playing, click a TV, and it starts playing there, over **DLNA**, **Google Cast**
+or **AirPlay**.
 
-The plugin is two parts:
+It is not screen mirroring. The TV fetches the file and decodes it itself, so
+the laptop stays cool and silent, and 4K or HEVC files play at full quality.
 
-- the bar widget (`BarWidget.qml`, `Panel.qml`), hosted by the Omarchy shell;
-- `omarchy-castd`, a small Rust daemon that owns the receiver connection and an
-embedded HTTP media server. It runs as a `systemd --user` service and the
-widget talks to it over a unix socket, so the panel always shows the real
-live state and controls are instant.
+## Features
 
+| | |
+| --- | --- |
+| **One click** | Every TV and receiver on your Wi-Fi is listed in the bar. Click one to cast. |
+| **Casts what you are watching** | Reads the current file from VLC, mpv, Celluloid or any other MPRIS player. |
+| **Full remote** | Pause, resume, seek, receiver volume and mute, all from the panel. |
+| **Audio boost** | +6 / +12 dB with a limiter for quiet movie mixes, and a dialogue-first stereo downmix for 5.1. |
+| **Subtitles** | Sidecar `.srt` / `.vtt` / `.ass` files and embedded text tracks, on Google Cast receivers. |
+| **Smart codec handling** | Plays the file as is when the TV can, otherwise remuxes, and transcodes only when it has to. |
+| **Private by design** | LAN only, one file per cast, served to the TV's IP alone. No cloud, no telemetry. |
 
-
-## Requirements
-
-
-| Requirement                                                              | Why                                                                 |
-| ------------------------------------------------------------------------ | ------------------------------------------------------------------- |
-| Omarchy 4.0.x with the Omarchy shell (tested on 4.0.3, quickshell 0.3.1) | hosts the widget                                                    |
-| `ffmpeg` / `ffprobe` (standard on Omarchy)                               | media probing, subtitle conversion, audio boost                     |
-| Rust 1.98.1 (pinned in `rust-toolchain.toml`; setup installs it via rustup), `cmake`, a C compiler | to build `omarchy-castd` once |
-| `systemd --user`                                                         | keeps the daemon running; without it the daemon is spawned directly |
-| optional: `ufw` + polkit                                                 | if `ufw` is enabled, a per-receiver rule opens the media port       |
-
-
-Rust crate dependencies are pinned in `Cargo.lock`; all are MIT/Apache-2.0
-licensed except `aws-lc-sys` (ISC/Apache-2.0/OpenSSL), pulled in by `rustls`.
-The compiler is pinned the same way: `rust-toolchain.toml` names one exact Rust
-release, `bin/omarchy-cast-setup` installs it through rustup only if it is
-missing (rustup verifies the download against the signed release manifests),
-and the build never uses a moving `stable` channel.
+<table>
+  <tr>
+    <td width="50%"><img src="preview.png" alt="UniCast panel listing receivers"></td>
+    <td width="50%"><img src="assets/playing.png" alt="UniCast panel while casting, with seek, volume and audio boost"></td>
+  </tr>
+  <tr>
+    <td align="center"><sub>Pick a receiver</sub></td>
+    <td align="center"><sub>While casting: seek, volume, boost, stop</sub></td>
+  </tr>
+</table>
 
 ## Install
 
-1. Add the widget:
-  ```sh
-   omarchy plugin add https://github.com/liberuum/unicast --enable
-  ```
-   The widget lands disabled until you confirm; `--enable` places it in the
-   bar's right section (or run `omarchy plugin enable universal-cast`).
-2. Build and install the backend. Either click **Build and install the
-  backend** in the widget's Settings, or run:
-   The script installs missing build/runtime packages through `omarchy pkg add`
-   (asking first), builds `omarchy-castd` into `~/.cache/omarchy-cast/target`,
-   installs it to `~/.local/bin/omarchy-castd`, and starts it as the
-   `omarchy-castd.service` user unit.
+UniCast has two parts: the bar widget, and `omarchy-castd`, a small Rust
+daemon that talks to the TV. The daemon is built once, on your machine.
 
-Manual equivalent, from a checkout of this repository:
+**1. Add the widget**
+
+```sh
+omarchy plugin add https://github.com/liberuum/unicast --enable
+```
+
+`--enable` places it in the right section of the bar. Without it the widget
+stays disabled until you run `omarchy plugin enable universal-cast`.
+
+**2. Build the backend**
+
+Open the widget and click **Build and install the backend**, or run:
+
+```sh
+~/.config/omarchy/plugins/universal-cast/bin/omarchy-cast-setup
+```
+
+The script:
+
+- installs anything missing (`rustup`, `cmake`, `ffmpeg`) through `omarchy pkg add`, asking first;
+- builds the daemon with the exact Rust release pinned in `rust-toolchain.toml`;
+- installs it to `~/.local/bin/omarchy-castd` and starts it as the `omarchy-castd.service` user unit.
+
+The first build takes a minute or two. The panel switches to the device list on
+its own when the daemon answers.
+
+<details>
+<summary><b>Manual build or pacman package</b></summary>
+
+From a checkout of this repository:
 
 ```sh
 cargo build --release --locked
 install -Dm755 target/release/omarchy-castd ~/.local/bin/omarchy-castd
 ```
 
-A `PKGBUILD` is included for people who prefer a pacman package
-(`makepkg -si` from a tagged release).
+A `PKGBUILD` is included if you prefer a pacman package: run `makepkg -si` from
+a tagged release.
 
-## Update
+</details>
+
+### Requirements
+
+| Requirement | Why |
+| --- | --- |
+| Omarchy 4.0.x with the Omarchy shell | hosts the widget (tested on 4.0.3, quickshell 0.3.1) |
+| `ffmpeg` / `ffprobe` | media probing, subtitle conversion, audio boost, transcoding |
+| Rust 1.98.1, `cmake`, a C compiler | to build the daemon once (setup installs them) |
+| `systemd --user` | keeps the daemon running (without it the daemon is spawned directly) |
+| optional: `ufw` + polkit | if `ufw` is enabled, a per-receiver rule opens the media port |
+
+## Usage
+
+1. Play a video in VLC, mpv or another MPRIS player, **or** click **Choose media to play**.
+2. Click the **UniCast** icon in the bar. It scans for receivers.
+3. Click a TV. The panel goes *connecting → buffering → playing*.
+4. Use pause, the seek bar, volume, audio boost and subtitles while it plays.
+5. Press **Stop**, or click the cast icon at the top, to end the cast.
+
+A TV that does not show up can be added by IP in **Settings → Add a device by IP**.
+
+## Supported receivers
+
+| Protocol | Devices | What works |
+| --- | --- | --- |
+| **DLNA / UPnP** | Samsung, LG, Sony and most smart TVs, consoles, Kodi | Play, seek, pause, volume and mute via `RenderingControl`, audio boost. The TV decodes HEVC/MKV natively. |
+| **Google Cast** | Chromecast, Android TV, Google TV, many soundbars | Play, seek, pause, volume, mute, audio boost, subtitles. Remuxes or transcodes for devices that need it. |
+| **AirPlay** | Apple TV and other AirPlay 1 receivers | URL playback over the legacy AirPlay HTTP API. AirPlay 2-only devices need pairing and are routed over DLNA or Cast instead. *Untested.* |
+
+When a device speaks several protocols, UniCast uses the most capable one
+(DLNA > Cast > AirPlay) and remembers the others as alternates.
+
+**Tested on** Omarchy 4.0.3 (quickshell 0.3.1, ffmpeg 9.0.1), x86_64, with:
+
+- **Chromecast**: play, seek, volume, mute, boost, subtitles
+- **Samsung UE75TU7125** (2020 TU7000 series) over DLNA: play, seek, volume, mute, boost via MPEG-TS
+- **LG webOS UR74006LB** (Chromecast built-in) over Google Cast: play, seek
+
+Not tested yet: AirPlay receivers, vertical bars, multi-monitor bars, and
+Omarchy versions other than 4.0.x.
+
+## How it works
+
+<p align="center">
+  <img src="assets/how-it-works.png" alt="The bar widget talks to omarchy-castd over a unix socket; the daemon tells the TV to play a URL, and the TV fetches the file from the daemon's media server" width="100%">
+</p>
+
+The widget is only a remote. `omarchy-castd` runs as a `systemd --user`
+service and owns the receiver connection. It tells the TV which URL to play,
+then serves that one file from an embedded HTTP server. The TV pulls the bytes
+and decodes them itself, so the panel always shows the receiver's real state
+and every control answers straight away.
+
+### Codec handling
+
+Each file is probed with `ffprobe` and, per receiver:
+
+1. **Served directly** when the device can decode it. An H.264/AAC MP4 stays byte-range seekable.
+2. **Remuxed** (`-c copy`) into a streamable container when the codecs fit but the container does not.
+3. **Transcoded** only when a codec is unsupported, for example HEVC to an original Chromecast.
+
+Cast receivers get fragmented MP4. DLNA renderers get MPEG-TS announced with a
+nominal Content-Length, because Samsung's player rejects chunked and fragmented
+streams.
+
+### Volume and audio boost
+
+Movie mixes are often 8 to 15 dB quieter than TV and streaming apps, and the
+receiver plays the file exactly as mastered. There are two remedies:
+
+- **Receiver volume.** A slider and mute button, same as the TV remote. Supported natively by Google Cast, and by DLNA renderers that expose `RenderingControl` (Samsung, LG and most TVs). AirPlay URL playback has no volume API, so the slider is hidden there.
+- **Audio boost** (Off / +6 dB / +12 dB). The soundtrack is re-encoded to stereo AAC with the chosen gain and a look-ahead limiter against clipping. 5.1 sources get a dialogue-forward downmix. Video is copied, not re-encoded. The setting is remembered, and changing it mid-cast restarts the stream where it is.
+
+### Subtitles
+
+On Google Cast receivers the panel offers a **Subtitles** picker. It finds:
+
+- sidecar files next to the video (`Movie.srt`, `Movie.en.srt`, or a `Subs/` folder);
+- text subtitle streams inside the container (MKV `subrip`/`ass`, MP4 `mov_text`).
+
+Each track is converted to WebVTT on first use (Latin-1 `.srt` files included),
+re-timed after a seek, and switching tracks is instant. Bitmap subtitles
+(PGS/VobSub) cannot be shown this way. Your last choice is remembered per
+language.
+
+DLNA TVs show a file's *embedded* subtitles through their own menu when the
+file is served directly. Sidecar files over DLNA are not supported yet, and
+AirPlay has no subtitle channel.
+
+## Troubleshooting
+
+<details>
+<summary><b>My TV does not show up</b></summary>
+
+- Make sure the TV is on and on the **same network and subnet** as the laptop. Guest networks and "AP isolation" block discovery.
+- VPNs that route the LAN (for example Tailscale with `--accept-routes`) can hide local devices.
+- Enable **Settings → Scan the whole network (multicast)**, or add the TV by IP.
+
+</details>
+
+<details>
+<summary><b>The TV finds the video but never starts playing</b></summary>
+
+If `ufw` is enabled, the TV must be allowed to reach port 60020. UniCast asks
+polkit to add a rule the first time you cast to a new TV, so approve that
+prompt. List the rules it added with `sudo ufw status | grep universal-cast`.
+
+</details>
+
+<details>
+<summary><b>The movie is too quiet</b></summary>
+
+Use **Audio boost +6 dB** or **+12 dB**. The TV volume alone often cannot make
+up for a quiet cinema mix.
+
+</details>
+
+<details>
+<summary><b>Logs</b></summary>
 
 ```sh
-omarchy plugin update universal-cast     # shows the diff, fast-forwards
-~/.config/omarchy/plugins/universal-cast/bin/omarchy-cast-setup   # rebuild the daemon if src/ changed
+journalctl --user -u omarchy-castd -f
 ```
 
+The daemon logs every receiver request and every ffmpeg command line. Run it
+with `OMARCHY_CAST_LOG=omarchy_castd=debug` for protocol-level detail.
 
+</details>
 
-## Remove
+## Update and remove
 
 ```sh
-~/.config/omarchy/plugins/universal-cast/bin/omarchy-cast-uninstall   # daemon, unit, firewall rules, cache
-omarchy plugin remove universal-cast                                   # the widget
+# Update: shows the diff, fast-forwards, then rebuild the daemon if src/ changed
+omarchy plugin update universal-cast
+~/.config/omarchy/plugins/universal-cast/bin/omarchy-cast-setup
+
+# Remove: daemon, unit, firewall rules and cache, then the widget
+~/.config/omarchy/plugins/universal-cast/bin/omarchy-cast-uninstall
+omarchy plugin remove universal-cast
 ```
 
-The uninstall script keeps your settings in `~/.config/omarchy/cast/`; pass
+The uninstall script keeps your settings in `~/.config/omarchy/cast/`. Pass
 `--purge` to delete them too. Nothing else is left behind.
 
 ## What it touches
 
-Everything is per-user; the plugin never asks for root except the optional
-firewall rule below.
+Everything is per-user. The only privileged action is the optional firewall
+rule described below.
 
-- **Files written:** `~/.local/bin/omarchy-castd` (the daemon),
-`~/.config/systemd/user/omarchy-castd.service` (created on first use, enabled
-for your session), `~/.config/omarchy/cast/` (settings, manual receiver IPs,
-firewall ledger), `~/.cache/omarchy-cast/` (build output), `~/.rustup/` (the
-pinned Rust toolchain, only when it has to be downloaded),
-`$XDG_RUNTIME_DIR/universal-cast/` (socket, subtitle cache). It never
-edits `shell.json` itself; placement goes through `omarchy plugin enable`.
-- **Processes:** `omarchy-castd` (daemon), `ffprobe` per cast, `ffmpeg` while a
-stream is remuxed/boosted, `xdg-terminal-exec` when you press the install
-button in Settings.
-- **Network:** LAN only. SSDP multicast and mDNS for discovery, HTTP/SOAP to
-the receiver, TLS to a Cast device on port 8009, and an HTTP media server on
-port 60020 bound to your LAN address. Each cast serves one file under an
-unguessable token to the target receiver's IP only. No internet access, no
-telemetry.
-- **Privilege:** if `ufw` is enabled, casting to a new receiver runs
-`pkexec ufw allow from <receiver-ip> proto tcp to any port 60020`. Polkit
-asks you each time a new receiver is added; the rules are recorded and
-removed by the uninstall script (or the daemon's `clear-firewall` verb).
-- **Media players:** the "cast what is playing" path reads the current file
-from any MPRIS player (VLC, mpv, Celluloid…) over D-Bus.
-
-
-
-## Usage
-
-1. Open a video in VLC, mpv or another MPRIS player, or pick a file with
-  **Choose media to play**.
-2. Click the **UniCast** widget. It scans for receivers.
-3. Click a device. The panel shows connecting → buffering → playing, with
-  pause, seek, volume, boost and subtitles while it plays.
-4. Press **Stop** (or click the hero icon) to end the cast.
-
-A device that does not announce itself can be added by IP in **Settings → Add a
-device by IP**.
-
-## Protocols
-
-
-| Protocol        | Devices                                           | Notes                                                                                                                                                         |
-| --------------- | ------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **DLNA / UPnP** | Samsung, LG, Sony, most smart TVs, consoles, Kodi | The TV decodes HEVC/MKV natively. Volume via RenderingControl.                                                                                                |
-| **Google Cast** | Chromecast, Android TV, Google TV, many soundbars | Talks CASTV2 directly. Codec-gated: remuxes or transcodes to H.264/MP4 for devices that need it. Volume and subtitles supported.                              |
-| **AirPlay**     | Apple TV and other AirPlay 1 receivers            | URL playback over the legacy AirPlay HTTP API. AirPlay 2-only devices require pairing and are routed over DLNA/Cast instead. **Untested**, see Compatibility. |
-
-
-When one device speaks several protocols it is routed over the most capable one
-(DLNA > Cast > AirPlay) and the others are remembered as alternates.
-
-### Codec handling
-
-The backend probes each file with `ffprobe` and, per receiver:
-
-- serves it directly when the device can decode it (an H.264/AAC MP4 stays
-byte-range seekable);
-- remuxes an already-compatible codec into a streamable container (`-c copy`);
-- transcodes with `ffmpeg` only when the codec is unsupported (for example HEVC
-to an original Chromecast).
-
-Cast receivers get fragmented MP4; DLNA renderers get MPEG-TS announced with a
-nominal Content-Length, because Samsung's player rejects chunked and fragmented
-streams. DLNA receivers otherwise decode HEVC/MKV directly, so no transcode is
-used.
-
-## Volume and audio boost
-
-Movie mixes are mastered far quieter than TV and streaming content (often 8 to
-15 dB below), and the receiver plays the file exactly as mastered. The panel
-offers two remedies while casting:
-
-- **Receiver volume**: a slider plus mute, same as the TV remote. Google Cast
-receivers support it natively; DLNA renderers need a `RenderingControl`
-service (Samsung, LG and most TVs have one). AirPlay URL playback has no
-volume API, so the slider is hidden there.
-- **Audio boost** (Off / +6 dB / +12 dB): the soundtrack is re-encoded to
-stereo AAC with the chosen gain and a look-ahead limiter against clipping; 5.1
-sources get a dialogue-forward downmix. Video is copied, not re-encoded, but
-seeking then goes through a stream restart instead of byte ranges. The
-setting is remembered for later casts, and changing it during a cast restarts
-the stream at the current position.
-
-
-
-## Subtitles
-
-Google Cast receivers render sidecar text tracks, so while casting to a
-Chromecast, Android TV or Google-TV-equipped TV the panel offers a **Subtitles**
-picker. Candidates are gathered per file: `.srt`/`.vtt`/`.ass` files next to
-the video (`Movie.srt`, `Movie.en.srt`, a `Subs/` folder) and text subtitle
-streams inside the container (MKV `subrip`/`ass`, MP4 `mov_text`). Each is
-converted to WebVTT with ffmpeg on first use, served next to the media with the
-CORS headers Cast requires, and declared as tracks in the load request, so
-switching or turning them off is instant. Bitmap subtitles (PGS/VobSub) cannot
-be shown this way. The last choice is remembered per language.
-
-DLNA renderers show a file's embedded subtitles through the TV's own menu when
-the file is served directly; sidecar files over DLNA are not wired up yet, and
-AirPlay URL playback has no subtitle channel.
-
-## Compatibility
-
-Tested on Omarchy 4.0.3 (quickshell 0.3.1, ffmpeg 9.0.1), single laptop, x86_64,
-with:
-
-- Chromecast ("Living Room TV"): play, seek, volume, mute, boost, subtitles;
-- Samsung UE75TU7125 (2020 TU7000 series) over DLNA: play, seek, volume, mute,
-boost via MPEG-TS;
-- LG webOS UR74006LB (Chromecast built-in) over Google Cast: play, seek.
-
-Not tested: AirPlay receivers, vertical bars, multi-monitor bars, Omarchy
-versions other than 4.0.x. The Quattro plugin contract is still evolving, so
-newer shells may need adjustments.
+| | |
+| --- | --- |
+| **Files** | `~/.local/bin/omarchy-castd` (daemon) · `~/.config/systemd/user/omarchy-castd.service` · `~/.config/omarchy/cast/` (settings, manual IPs, firewall ledger) · `~/.cache/omarchy-cast/` (build output) · `~/.rustup/` (the pinned toolchain, only if it had to be downloaded) · `$XDG_RUNTIME_DIR/universal-cast/` (socket, subtitle cache) |
+| **Processes** | `omarchy-castd`, `ffprobe` per cast, `ffmpeg` while a stream is remuxed or boosted, `xdg-terminal-exec` when you press the install button |
+| **Network** | LAN only: SSDP and mDNS discovery, HTTP/SOAP to the receiver, TLS to Cast devices on port 8009, and a media server on port 60020 bound to your LAN address |
+| **Privilege** | If `ufw` is enabled, casting to a new receiver runs `pkexec ufw allow from <receiver-ip> proto tcp to any port 60020`. Polkit asks each time. The rules are recorded and removed by the uninstall script. |
+| **Media players** | Reads the current file from MPRIS players over D-Bus |
+| **Your config** | Never edits `shell.json`; bar placement goes through `omarchy plugin enable` |
 
 ## Security
 
-- The media server binds to the LAN IP only (never `0.0.0.0`) and refuses to
-start without an explicit bind address.
-- Each cast serves exactly one file under an unguessable path token (compared
-in constant time) to an allowlist containing only the receiver's IP.
-- Device names, models, IPs and paths (attacker-influenceable over mDNS/SSDP)
-flow through argv arrays with validation, never through a shell string, and
-are XML-escaped in DLNA metadata. Description fetches do not follow
-redirects and are size-capped; a device may only point its control URLs at
-itself over http(s).
-- The build toolchain is pinned to one exact Rust release
-  (`rust-toolchain.toml`); setup installs that version via rustup
-  (checksum-verified against the signed release manifests, never a moving
-  `stable` channel) and builds with `--locked`, so the same plugin commit
-  always compiles with the same compiler and the same checksummed crates.
-- Private runtime and config state is owner-only (mode 0700; socket 0600).
-- The widget runs unsandboxed inside the Omarchy shell like every plugin;
-review the code before enabling it. See [SECURITY.md](SECURITY.md) for how to
-report a vulnerability. Marketplace listing is not a security audit.
+- **Tight media server.** It binds to the LAN IP only (never `0.0.0.0`), serves exactly one file per cast under an unguessable token (compared in constant time), and answers only the receiver's IP. It stops streaming the moment the cast ends.
+- **Untrusted network input.** Device names, models, IPs and paths come from mDNS/SSDP, so they:
+  - flow through argv arrays with validation, never through a shell string;
+  - are XML-escaped in DLNA metadata.
 
-
-
-## Support
-
-Questions and bugs: [https://github.com/liberuum/unicast/issues](https://github.com/liberuum/unicast/issues). Please
-include `journalctl --user -u omarchy-castd` output; the daemon logs every
-receiver request and ffmpeg command line.
+  In addition, SSDP answers may only describe the host that sent them, device descriptions are size-capped and never follow redirects, and a device's control URLs must point back at itself.
+- **Reproducible build.** The compiler is pinned to one exact Rust release, which rustup verifies against the signed release manifests. Crates are pinned and checksummed by `Cargo.lock` and built with `--locked`. CI actions are pinned to full commit SHAs.
+- **Private state.** Runtime and config state is owner-only (mode 0700, socket 0600).
+- **Review before enabling.** Like every Omarchy plugin, the widget runs unsandboxed inside the shell, so review the code first. Marketplace listing is not a security audit. See [SECURITY.md](SECURITY.md) to report a vulnerability.
 
 ## Development
 
 ```sh
-tests/run                      # manifest check, cargo fmt/clippy/test, QML parse
-cargo build --release
+tests/run                  # manifest, toolchain and CI pins, cargo fmt/clippy/test, QML parse, shell scripts
+cargo build --release      # uses the Rust version pinned in rust-toolchain.toml
 ```
 
-Both use the Rust version pinned in `rust-toolchain.toml` automatically when
-rustup manages `cargo`; `tests/run` also fails if the pin and CI drift apart.
+The widget talks to the daemon with newline-delimited JSON over
+`$XDG_RUNTIME_DIR/universal-cast/castd.sock`. `bin/omarchy-cast` forwards the
+panel's verbs (`status`, `discover`, `connect`, `pause`, `seek`, `set-volume`,
+`set-boost`, `set-subtitle`, …) to it, and you can call them yourself:
 
-The wire contract is newline-delimited JSON over
-`$XDG_RUNTIME_DIR/universal-cast/castd.sock`; `bin/omarchy-cast` forwards
-the widget's verbs (`status`, `discover`, `connect`, `pause`, `seek`,
-`set-volume`, `set-boost`, `set-subtitle`, …) to it. See
-[CHANGELOG.md](CHANGELOG.md) for release notes.
+```sh
+omarchy-castd --client discover
+omarchy-castd --client connect 192.168.1.20 ~/Videos/movie.mkv
+omarchy-castd --client status
+```
+
+Release notes are in [CHANGELOG.md](CHANGELOG.md).
+
+## Support
+
+Questions and bugs: [github.com/liberuum/unicast/issues](https://github.com/liberuum/unicast/issues).
+Please include the output of `journalctl --user -u omarchy-castd`.
 
 ## License
 
-MIT, see [LICENSE](LICENSE). Not affiliated with Google, Apple, Samsung, or LG.
+MIT, see [LICENSE](LICENSE). Not affiliated with Google, Apple, Samsung or LG.
 Chromecast and Google Cast are trademarks of Google LLC; AirPlay is a trademark
 of Apple Inc.

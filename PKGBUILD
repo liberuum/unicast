@@ -7,15 +7,24 @@ arch=('x86_64' 'aarch64')
 url="https://github.com/liberuum/unicast"
 license=('MIT')
 depends=('ffmpeg')
-makedepends=('cargo' 'cmake' 'clang' 'git')
-provides=('omarchy-castd')
+makedepends=('cargo' 'cmake' 'clang')
+optdepends=('ufw: per-receiver firewall rule for the media port'
+            'polkit: authorizes that firewall rule')
 source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
-# Update on release: updpkgsums
-sha256sums=('SKIP')
+# Tracks the newest tag whose tarball checksum is known; after tagging a
+# release, bump pkgver and run updpkgsums.
+sha256sums=('30c3f47969760d0f807379198d056ba291986df6d58bbbe99002d190f154a1f9')
+
+prepare() {
+  cd "$srcdir/unicast-$pkgver"
+  # Fetch the locked crates up front so build() works offline (clean chroot).
+  cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+}
 
 build() {
   cd "$srcdir/unicast-$pkgver"
-  cargo build --release --locked
+  export CARGO_TARGET_DIR=target
+  cargo build --frozen --release
 }
 
 package() {

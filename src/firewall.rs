@@ -39,15 +39,21 @@ pub async fn clear() {
         return;
     }
     let port = util::cast_port().to_string();
+    let mut remaining = std::collections::BTreeSet::new();
     for ip in &ledger {
         let comment = format!("universal-cast-{ip}");
-        run(&[
+        let removed = run(&[
             "--force", "delete", "allow", "from", ip, "proto", "tcp", "to", "any", "port", &port,
             "comment", &comment,
         ])
         .await;
+        // Keep what could not be removed (polkit declined, timed out) so a
+        // later `clear` and the uninstall script still know about it.
+        if !removed {
+            remaining.insert(ip.clone());
+        }
     }
-    settings::write_firewall_ledger(&std::collections::BTreeSet::default());
+    settings::write_firewall_ledger(&remaining);
 }
 
 async fn run(args: &[&str]) -> bool {
@@ -56,7 +62,11 @@ async fn run(args: &[&str]) -> bool {
     command
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
+        .stderr(std::process::Stdio::null())
+        // On timeout the future is dropped: take pkexec (and its polkit prompt)
+        // down with it, or a late approval would add a rule the ledger never
+        // records and `clear` never removes.
+        .kill_on_drop(true);
     match tokio::time::timeout(TIMEOUT, command.status()).await {
         Ok(Ok(status)) => status.success(),
         _ => false,

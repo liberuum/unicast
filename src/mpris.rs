@@ -57,10 +57,10 @@ fn file_url_to_path(url: &str) -> Option<String> {
     if parsed.scheme() != "file" {
         return None;
     }
-    let path = parsed.path();
-    Some(
-        percent_encoding::percent_decode_str(path)
-            .decode_utf8_lossy()
-            .to_string(),
-    )
+    // A lossy decode would turn a non-UTF-8 name into a path that does not
+    // exist; report "no file" instead of a misleading "file not found".
+    percent_encoding::percent_decode_str(parsed.path())
+        .decode_utf8()
+        .ok()
+        .map(std::borrow::Cow::into_owned)
 }

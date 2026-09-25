@@ -1,4 +1,4 @@
-use std::net::TcpStream;
+use std::net::{TcpStream, ToSocketAddrs};
 use std::path::Path;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
@@ -471,12 +471,16 @@ fn load_media(
                 MediaResponse::Status(status) => {
                     // Some receivers answer with a status that lacks our request
                     // id; accept one that already carries the media we asked for.
+                    // Not an idle one, though: a restream at the same position
+                    // reuses the URL, and the old session's "Interrupted" status
+                    // would otherwise pass for the new load and end the cast.
                     let ours = status.request_id == request_id
                         || status.entries.iter().any(|entry| {
-                            entry
-                                .media
-                                .as_ref()
-                                .is_some_and(|loaded| loaded.content_id == content_id)
+                            entry.player_state != PlayerState::Idle
+                                && entry
+                                    .media
+                                    .as_ref()
+                                    .is_some_and(|loaded| loaded.content_id == content_id)
                         });
                     Ok(ours.then_some(status))
                 }
@@ -608,7 +612,14 @@ fn run_session(
 ) -> Result<(), String> {
     // A Reload swaps the stream URL and its seek behaviour mid-session.
     let mut options = initial_options.clone();
-    let tcp = TcpStream::connect((host, CAST_PORT))
+    let address = (host, CAST_PORT)
+        .to_socket_addrs()
+        .ok()
+        .and_then(|mut addresses| addresses.next())
+        .ok_or_else(|| format!("invalid cast host: {host}"))?;
+    // A bounded connect, so a timed-out attempt does not linger and finish its
+    // handshake behind the retry's back.
+    let tcp = TcpStream::connect_timeout(&address, SETUP_TIMEOUT)
         .map_err(|error| format!("Chromecast at {host} not reachable: {error}"))?;
     let timeout_handle = tcp
         .try_clone()
@@ -669,7 +680,14 @@ fn run_session(
         .set_read_timeout(Some(POLL_TIMEOUT))
         .map_err(|error| format!("could not configure cast socket: {error}"))?;
 
-    let mut media_session_id = 0_i32;
+    // Track the media session our load created. Starting from 0 would adopt
+    // whichever session the receiver reports first, which after a quick
+    // re-cast is often the previous one; its "Interrupted" status would then
+    // end this cast.
+    let mut media_session_id = initial_status
+        .entries
+        .first()
+        .map_or(0, |entry| entry.media_session_id);
     let mut consecutive_errors = 0_u32;
     let mut running = true;
     let mut last_poll = Instant::now();
@@ -807,7 +825,13 @@ fn run_session(
         if is_stale(state, session_id) {
             return Ok(());
         }
-        match receive(&manager, &connection_channel, &heartbeat, &media, &receiver) {
+        let incoming = receive(&manager, &connection_channel, &heartbeat, &media, &receiver);
+        // Only a run of failures means the link is gone; an odd message the
+        // library cannot parse over a two-hour film must not end the session.
+        if incoming.is_ok() {
+            consecutive_errors = 0;
+        }
+        match incoming {
             Ok(ChannelMessage::Heartbeat(_)) => {
                 let _ = heartbeat.pong();
             }

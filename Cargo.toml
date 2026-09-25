@@ -1,6 +1,6 @@
 [package]
 name = "omarchy-castd"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 rust-version = "1.85"
 description = "UniCast backend: cast local media to DLNA, Google Cast and AirPlay receivers"
@@ -12,6 +12,7 @@ homepage = "https://github.com/liberuum/unicast"
 anyhow = "1.0.104"
 axum = "0.8.9"
 bytes = "1.12.1"
+futures-util = { version = "0.3.34", default-features = false }
 http-body-util = "0.1.5"
 libc = "0.2.189"
 mdns-sd = "0.21.3"

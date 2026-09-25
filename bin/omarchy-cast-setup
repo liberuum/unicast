@@ -18,6 +18,8 @@ set -euo pipefail
 HERE=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 CACHE=${XDG_CACHE_HOME:-$HOME/.cache}/omarchy-cast
 export CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-$CACHE/target}
+# Absolute, because the build runs from the checkout but `install` below does not.
+CARGO_TARGET_DIR=$(realpath -m -- "$CARGO_TARGET_DIR")
 BIN_DIR=$HOME/.local/bin
 UNIT=omarchy-castd.service
 
@@ -27,7 +29,7 @@ die() { printf 'omarchy-cast: %s\n' "$*" >&2; exit 1; }
 [[ -f $HERE/Cargo.toml && -d $HERE/src ]] || die "run this from the plugin checkout (Cargo.toml not found in $HERE)"
 
 # Exact Rust release this checkout builds with, from rust-toolchain.toml.
-PINNED=$(awk -F'"' '/^[[:space:]]*channel[[:space:]]*=/ {print $2; exit}' "$HERE/rust-toolchain.toml" 2>/dev/null)
+PINNED=$(awk -F'"' '/^[[:space:]]*channel[[:space:]]*=/ {print $2; exit}' "$HERE/rust-toolchain.toml" 2>/dev/null || true)
 [[ ${PINNED:-} =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "rust-toolchain.toml must pin an exact version like 1.98.1 (got '${PINNED:-none}')"
 
 missing=()
@@ -73,9 +75,12 @@ mkdir -p "$CACHE"
 install -Dm755 "$CARGO_TARGET_DIR/release/omarchy-castd" "$BIN_DIR/omarchy-castd"
 say "installed $BIN_DIR/omarchy-castd"
 
+# Stop rather than restart: a restart would re-run whatever ExecStart the unit
+# already has (a packaged /usr/bin build, an old dev build). With the daemon
+# down, the client below rewrites the unit for this binary and starts it.
 if systemctl --user is-active --quiet "$UNIT" 2>/dev/null; then
-  systemctl --user restart "$UNIT"
-  say "restarted $UNIT onto the new binary"
+  systemctl --user stop "$UNIT"
+  say "stopped $UNIT to switch it to the new binary"
 fi
 # The client installs and starts the user unit on first contact.
 if "$BIN_DIR/omarchy-castd" --client ping | grep -q '"ok": *true'; then

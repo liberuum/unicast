@@ -12,6 +12,7 @@ use axum::http::{HeaderMap, Method, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::any;
 use axum::serve::ListenerExt;
+use futures_util::StreamExt;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio::process::Command;
 use tokio_util::io::ReaderStream;
@@ -216,7 +217,7 @@ async fn handle(
     axum::extract::RawQuery(query): axum::extract::RawQuery,
 ) -> Response {
     if !config.allow.is_empty() && !config.allow.iter().any(|ip| *ip == peer.ip()) {
-        tracing::warn!("403 {} from {}", rest, peer.ip());
+        tracing::warn!("403 {:?} from {}", rest, peer.ip());
         return forbidden();
     }
     if !constant_time_eq(&token, &config.token) {
@@ -226,14 +227,18 @@ async fn handle(
     if method == Method::OPTIONS {
         return preflight();
     }
+    // Debug-formatted: the path and query come from the network and must not
+    // be able to forge log lines.
     tracing::info!(
-        "{method} {rest}{} from {}{}",
-        query.as_deref().map_or(String::new(), |q| format!("?{q}")),
+        "{method} {rest:?}{} from {}{}",
+        query
+            .as_deref()
+            .map_or(String::new(), |q| format!(" query={q:?}")),
         peer.ip(),
         headers
             .get(header::RANGE)
             .and_then(|value| value.to_str().ok())
-            .map_or(String::new(), |range| format!(" range={range}"))
+            .map_or(String::new(), |range| format!(" range={range:?}"))
     );
     let start = query
         .as_deref()
@@ -242,13 +247,14 @@ async fn handle(
     if let Some(name) = rest.strip_prefix("sub/") {
         return match method {
             Method::GET => subtitle_response(&config, name, start).await,
-            Method::HEAD => cors(
+            Method::HEAD if subtitle_track(&config, name).is_some() => cors(
                 Response::builder()
                     .status(StatusCode::OK)
                     .header(header::CONTENT_TYPE, "text/vtt; charset=utf-8"),
             )
             .body(Body::empty())
             .expect("static response"),
+            Method::HEAD => (StatusCode::NOT_FOUND, "").into_response(),
             _ => (StatusCode::NOT_IMPLEMENTED, "").into_response(),
         };
     }
@@ -365,12 +371,13 @@ async fn get_response(config: &ServerConfig, headers: &HeaderMap, start: Option<
 
 /// `/{token}/sub/{id}.vtt[?start=S]`: the track as `WebVTT`, converted on first
 /// use and re-timed when the receiver plays a stream that began `S` seconds in.
+fn subtitle_track<'a>(config: &'a ServerConfig, name: &str) -> Option<&'a SubtitleTrack> {
+    let id = name.strip_suffix(".vtt")?.parse::<u32>().ok()?;
+    config.subtitles.iter().find(|track| track.id == id)
+}
+
 async fn subtitle_response(config: &ServerConfig, name: &str, start: Option<f64>) -> Response {
-    let id = name
-        .strip_suffix(".vtt")
-        .and_then(|id| id.parse::<u32>().ok());
-    let track = id.and_then(|id| config.subtitles.iter().find(|track| track.id == id));
-    let Some(track) = track else {
+    let Some(track) = subtitle_track(config, name) else {
         return (StatusCode::NOT_FOUND, "").into_response();
     };
     let path = {
@@ -427,6 +434,18 @@ async fn file_response(config: &ServerConfig, range: Option<&header::HeaderValue
         end = high.min(size.saturating_sub(1));
         partial = true;
     }
+    if size == 0 && !partial {
+        return dlna_headers(
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(header::ACCEPT_RANGES, "bytes")
+                .header(header::CONTENT_LENGTH, "0"),
+            &config.content_type,
+            false,
+        )
+        .body(Body::empty())
+        .expect("static response");
+    }
     if start > end || start >= size {
         return Response::builder()
             .status(StatusCode::RANGE_NOT_SATISFIABLE)
@@ -456,7 +475,11 @@ async fn file_response(config: &ServerConfig, range: Option<&header::HeaderValue
     if file.seek(std::io::SeekFrom::Start(start)).await.is_err() {
         return (StatusCode::INTERNAL_SERVER_ERROR, "").into_response();
     }
-    let body = Body::from_stream(ReaderStream::with_capacity(file.take(length), BUFSIZE_HINT));
+    // Ends with the session: `MediaServer::stop` only stops accepting, and a
+    // TV mid-download would otherwise keep pulling the file after Stop.
+    let stream = ReaderStream::with_capacity(file.take(length), BUFSIZE_HINT)
+        .take_until(config.shutdown.clone().cancelled_owned());
+    let body = Body::from_stream(stream);
     builder
         .header(header::CONTENT_LENGTH, length.to_string())
         .body(body)
@@ -470,12 +493,13 @@ fn parse_range(spec: &str, size: u64) -> Option<(u64, u64)> {
         return Some((size.saturating_sub(suffix), size.saturating_sub(1)));
     }
     let low: u64 = first.parse().ok()?;
-    let high: u64 = if second.is_empty() {
-        size.saturating_sub(1)
-    } else {
-        second.parse().ok()?
-    };
-    Some((low, high))
+    if second.is_empty() {
+        return Some((low, size.saturating_sub(1)));
+    }
+    let high: u64 = second.parse().ok()?;
+    // RFC 9110: a range whose last byte precedes its first is invalid and
+    // ignored (full 200 reply); a start past EOF stays unsatisfiable (416).
+    (low <= high).then_some((low, high))
 }
 
 fn transcode_response(config: &ServerConfig, start: Option<f64>) -> Response {
@@ -844,5 +868,6 @@ mod tests {
         assert_eq!(parse_range("abc-", 1000), None);
         assert_eq!(parse_range("0-abc", 1000), None);
         assert_eq!(parse_range("5", 1000), None);
+        assert_eq!(parse_range("5-2", 1000), None);
     }
 }
