@@ -69,10 +69,12 @@ pub struct TranscodePlan {
 }
 
 impl TranscodePlan {
-    /// The ffmpeg `-af` chain for a boosted soundtrack, or `None` when the
-    /// audio is left alone. The limiter keeps the boosted signal from clipping.
+    /// The ffmpeg `-af` chain for a boosted or downmixed soundtrack, or `None`
+    /// when the audio is left alone. The limiter keeps the boosted signal from
+    /// clipping.
     pub fn audio_filter(&self) -> Option<String> {
-        if self.gain_db <= 0 {
+        let downmix = self.channels > 2 && self.acodec != "copy";
+        if self.gain_db <= 0 && !downmix {
             return None;
         }
         let mut chain = Vec::new();
@@ -84,8 +86,10 @@ impl TranscodePlan {
                     .to_string(),
             );
         }
-        chain.push(format!("volume={}dB", self.gain_db));
-        chain.push("alimiter=limit=0.95:level=disabled".to_string());
+        if self.gain_db > 0 {
+            chain.push(format!("volume={}dB", self.gain_db));
+            chain.push("alimiter=limit=0.95:level=disabled".to_string());
+        }
         Some(chain.join(","))
     }
 }
@@ -598,7 +602,7 @@ fn spawn_ffmpeg(
         ]);
     }
     if let Some(filter) = plan.audio_filter() {
-        // Boosting means re-encoding, whatever the source codec was.
+        // Boosting or downmixing means re-encoding, whatever the source codec was.
         command.args(["-af", &filter, "-c:a", "aac", "-b:a", "192k", "-ac", "2"]);
     } else if plan.acodec == "copy" {
         command.args(["-c:a", "copy"]);
@@ -858,6 +862,14 @@ mod tests {
         let surround = plan(12, 6).audio_filter().expect("filter");
         assert!(surround.starts_with("pan=stereo|"));
         assert!(surround.ends_with(",volume=12dB,alimiter=limit=0.95:level=disabled"));
+        // A 5.1 source re-encoded for Cast gets the downmix even without boost.
+        let downmix = TranscodePlan {
+            acodec: "aac".to_string(),
+            ..plan(0, 6)
+        };
+        let filter = downmix.audio_filter().expect("downmix filter");
+        assert!(filter.starts_with("pan=stereo|"));
+        assert!(!filter.contains("volume="));
     }
 
     #[test]

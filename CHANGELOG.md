@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- Google Cast: films with 5.1 (or any multichannel) audio stopped a moment
+  after starting — the receiver rejects multichannel AAC with
+  `MEDIA_SRC_NOT_SUPPORTED`. Such soundtracks are now downmixed to stereo AAC
+  (dialogue-forward), with or without audio boost.
+- Receiver errors that end a Cast session are now logged.
+
 ## 0.1.2 — 2026-09-25
 
 ### Fixed

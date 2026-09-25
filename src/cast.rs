@@ -225,11 +225,8 @@ pub fn plan_transcode(path: &Path, model: &str, name: &str) -> CodecPlan {
     };
 
     let audio_name = audio.map_or(String::new(), |a| a.codec_name.clone());
-    let acodec = if !audio_name.is_empty() && !CAST_AUDIO_OK.contains(&audio_name.as_str()) {
-        "aac".to_string()
-    } else {
-        "copy".to_string()
-    };
+    let channels = audio.map_or(0, |a| a.channels);
+    let acodec = cast_audio_codec(&audio_name, channels).to_string();
     let shown_audio = if audio_name.is_empty() {
         "none"
     } else {
@@ -238,8 +235,19 @@ pub fn plan_transcode(path: &Path, model: &str, name: &str) -> CodecPlan {
     CodecPlan {
         vcodec,
         acodec,
-        channels: audio.map_or(0, |a| a.channels),
-        reason: format!("{vreason}; audio {shown_audio}"),
+        channels,
+        reason: format!("{vreason}; audio {shown_audio} {channels}ch"),
+    }
+}
+
+/// Audio handling for Cast receivers. The Default Media Receiver rejects
+/// multichannel AAC with `MEDIA_SRC_NOT_SUPPORTED` a moment after it starts
+/// playing, so anything beyond stereo is re-encoded (and downmixed) too.
+fn cast_audio_codec(name: &str, channels: u32) -> &'static str {
+    if name.is_empty() || (CAST_AUDIO_OK.contains(&name) && channels <= 2) {
+        "copy"
+    } else {
+        "aac"
     }
 }
 
@@ -1129,6 +1137,7 @@ fn publish_volume(
 }
 
 fn set_error(state: &Arc<RwLock<Session>>, session_id: u64, message: &str) {
+    tracing::warn!("cast session {session_id} failed: {message}");
     update(state, session_id, |session| {
         session.state = SessionState::Error;
         session.error = message.to_string();
@@ -1224,6 +1233,15 @@ mod tests {
             }
             other => panic!("unexpected parse result: {other:?}"),
         }
+    }
+
+    #[test]
+    fn multichannel_audio_is_reencoded_for_cast() {
+        assert_eq!(cast_audio_codec("aac", 2), "copy");
+        assert_eq!(cast_audio_codec("mp3", 2), "copy");
+        assert_eq!(cast_audio_codec("aac", 6), "aac");
+        assert_eq!(cast_audio_codec("ac3", 6), "aac");
+        assert_eq!(cast_audio_codec("", 0), "copy");
     }
 
     #[test]
