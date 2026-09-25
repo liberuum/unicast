@@ -13,6 +13,16 @@ const AIRPLAY_SERVICE: &str = "_airplay._tcp.local.";
 const AIRPLAY_SUFFIX: &str = "._airplay._tcp.local.";
 const CAST_PORT: u16 = 8009;
 const CAST_PROBE_TIMEOUT: Duration = Duration::from_millis(400);
+/// Receivers accepted from one mDNS scan. mDNS is unauthenticated, so a
+/// flood of fake services must not turn into a flood of probes.
+const MAX_MDNS_DEVICES: usize = 32;
+
+/// mDNS records can carry any address. Only private and link-local IPv4
+/// addresses are receivers on this LAN; anything else (loopback, public
+/// hosts) is ignored rather than probed.
+fn lan_address(ip: Ipv4Addr) -> bool {
+    (ip.is_private() || ip.is_link_local()) && !ip.is_broadcast()
+}
 
 pub async fn discover(
     lan_ip: Option<Ipv4Addr>,
@@ -56,7 +66,9 @@ fn mdns_devices() -> Vec<Device> {
                     } else {
                         airplay_device(&info)
                     };
-                    if let Some(device) = device {
+                    if let Some(device) = device
+                        && devices.len() < MAX_MDNS_DEVICES
+                    {
                         devices.push(device);
                     }
                 }
@@ -72,19 +84,36 @@ fn mdns_devices() -> Vec<Device> {
 /// `webOS`, for one) can show up in a given scan with only its `AirPlay` record,
 /// and would then be routed over the weaker protocol. Anything that answers
 /// on the Cast port is a Cast receiver, whatever the scan happened to hear.
-fn promote_cast_capable(devices: Vec<Device>, cast_open: impl Fn(&str) -> bool) -> Vec<Device> {
+fn promote_cast_capable(
+    devices: Vec<Device>,
+    cast_open: impl Fn(&str) -> bool + Sync,
+) -> Vec<Device> {
     let cast_ips: HashSet<String> = devices
         .iter()
         .filter(|device| device.protocol == "cast")
         .map(|device| device.ip.clone())
         .collect();
+    let to_probe: BTreeSet<&str> = devices
+        .iter()
+        .filter(|device| device.protocol == "airplay" && !cast_ips.contains(&device.ip))
+        .map(|device| device.ip.as_str())
+        .collect();
+    // Probed side by side, so the scan waits one timeout, not one per device.
+    let cast_open = &cast_open;
+    let open: HashSet<String> = std::thread::scope(|scope| {
+        let handles: Vec<_> = to_probe
+            .iter()
+            .map(|ip| scope.spawn(move || cast_open(ip).then(|| (*ip).to_string())))
+            .collect();
+        handles
+            .into_iter()
+            .filter_map(|handle| handle.join().ok().flatten())
+            .collect()
+    });
     devices
         .into_iter()
         .map(|device| {
-            if device.protocol != "airplay"
-                || cast_ips.contains(&device.ip)
-                || !cast_open(&device.ip)
-            {
+            if device.protocol != "airplay" || !open.contains(&device.ip) {
                 return device;
             }
             Device {
@@ -106,7 +135,10 @@ fn cast_port_open(ip: &str) -> bool {
 }
 
 fn cast_device(info: &ResolvedService) -> Option<Device> {
-    let ip = info.get_addresses_v4().into_iter().next()?;
+    let ip = info
+        .get_addresses_v4()
+        .into_iter()
+        .find(|ip| lan_address(*ip))?;
     let name = info.get_property_val_str("fn").map_or_else(
         || service_name(info.get_fullname(), CAST_SUFFIX),
         str::to_string,
@@ -133,7 +165,10 @@ fn cast_device(info: &ResolvedService) -> Option<Device> {
 }
 
 fn airplay_device(info: &ResolvedService) -> Option<Device> {
-    let ip = info.get_addresses_v4().into_iter().next()?;
+    let ip = info
+        .get_addresses_v4()
+        .into_iter()
+        .find(|ip| lan_address(*ip))?;
     let model = info
         .get_property_val_str("model")
         .unwrap_or_default()
@@ -240,19 +275,37 @@ mod tests {
     }
 
     #[test]
+    fn only_lan_addresses_are_receivers() {
+        for ip in ["192.168.1.8", "10.0.0.7", "172.16.4.2", "169.254.3.3"] {
+            assert!(lan_address(ip.parse().expect("ip")), "{ip}");
+        }
+        for ip in [
+            "127.0.0.1",
+            "8.8.8.8",
+            "0.0.0.0",
+            "224.0.0.251",
+            "255.255.255.255",
+        ] {
+            assert!(!lan_address(ip.parse().expect("ip")), "{ip}");
+        }
+    }
+
+    #[test]
     fn airplay_only_receiver_with_cast_port_becomes_cast() {
         let scanned = vec![
             device("10.0.0.7", "airplay", "LG TV"),
             device("10.0.0.8", "airplay", "Apple TV"),
             device("10.0.0.9", "cast", "Chromecast"),
         ];
-        let probed = std::cell::RefCell::new(Vec::new());
+        let probed = std::sync::Mutex::new(Vec::new());
         let promoted = promote_cast_capable(scanned, |ip| {
-            probed.borrow_mut().push(ip.to_string());
+            probed.lock().expect("probe log").push(ip.to_string());
             ip == "10.0.0.7"
         });
         // Only AirPlay-only receivers are probed; the Chromecast is left alone.
-        assert_eq!(probed.borrow().as_slice(), ["10.0.0.7", "10.0.0.8"]);
+        let mut probed = probed.into_inner().expect("probe log");
+        probed.sort();
+        assert_eq!(probed, ["10.0.0.7", "10.0.0.8"]);
         let lg = promoted.iter().find(|d| d.ip == "10.0.0.7").expect("lg");
         assert_eq!(lg.protocol, "cast");
         assert_eq!(lg.port, 8009);

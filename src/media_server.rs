@@ -19,6 +19,7 @@ use tokio_util::io::ReaderStream;
 use tokio_util::sync::CancellationToken;
 
 use crate::subtitles::{self, SubtitleTrack};
+use crate::util;
 
 /// Directly served file: byte-range seekable, not converted.
 const DLNA_FEATURES: &str =
@@ -117,8 +118,17 @@ pub struct ServerConfig {
     pub subtitle_dir: PathBuf,
     /// Serialises subtitle conversions so two requests never race on one file.
     pub convert: tokio::sync::Mutex<()>,
+    /// Subtitle tracks ffmpeg already failed to convert; not retried.
+    pub failed_subtitles: std::sync::Mutex<std::collections::HashSet<u32>>,
+    /// One cancel handle per live ffmpeg stream, oldest first.
+    pub live_transcodes: std::sync::Mutex<std::collections::VecDeque<CancellationToken>>,
     pub shutdown: CancellationToken,
 }
+
+/// Live ffmpeg streams allowed at once. A receiver opens one, occasionally
+/// two (a probe overlapping playback); a new request beyond that ends the
+/// oldest, so no client can pile up transcoders.
+const MAX_LIVE_TRANSCODES: usize = 2;
 
 pub struct MediaServer {
     task: tokio::task::JoinHandle<()>,
@@ -187,6 +197,8 @@ pub async fn start(
         subtitles: options.subtitles,
         subtitle_dir: options.subtitle_dir,
         convert: tokio::sync::Mutex::new(()),
+        failed_subtitles: std::sync::Mutex::new(std::collections::HashSet::new()),
+        live_transcodes: std::sync::Mutex::new(std::collections::VecDeque::new()),
         shutdown: shutdown.clone(),
     });
     let app = Router::new()
@@ -220,7 +232,8 @@ async fn handle(
     headers: HeaderMap,
     axum::extract::RawQuery(query): axum::extract::RawQuery,
 ) -> Response {
-    if !config.allow.is_empty() && !config.allow.iter().any(|ip| *ip == peer.ip()) {
+    // Fail closed: an empty allowlist admits nobody.
+    if !config.allow.iter().any(|ip| *ip == peer.ip()) {
         tracing::warn!("403 {:?} from {}", rest, peer.ip());
         return forbidden();
     }
@@ -247,7 +260,7 @@ async fn handle(
     let start = query
         .as_deref()
         .and_then(parse_start_query)
-        .filter(|start| start.is_finite() && *start > 0.0);
+        .filter(|start| start.is_finite() && *start > 0.0 && *start <= util::MAX_MEDIA_SECONDS);
     if let Some(name) = rest.strip_prefix("sub/") {
         return match method {
             Method::GET => subtitle_response(&config, name, start).await,
@@ -384,15 +397,31 @@ async fn subtitle_response(config: &ServerConfig, name: &str, start: Option<f64>
     let Some(track) = subtitle_track(config, name) else {
         return (StatusCode::NOT_FOUND, "").into_response();
     };
+    let known_bad = |config: &ServerConfig| {
+        config
+            .failed_subtitles
+            .lock()
+            .is_ok_and(|failed| failed.contains(&track.id))
+    };
+    if known_bad(config) {
+        return (StatusCode::NOT_FOUND, "").into_response();
+    }
     let path = {
         let _guard = config.convert.lock().await;
+        // A request that queued behind a failing conversion must not rerun it.
+        if known_bad(config) {
+            return (StatusCode::NOT_FOUND, "").into_response();
+        }
         subtitles::ensure_vtt(track, &config.file, &config.subtitle_dir).await
     };
     let path = match path {
         Ok(path) => path,
         Err(error) => {
             tracing::warn!("subtitle track {} unavailable: {error}", track.id);
-            return (StatusCode::INTERNAL_SERVER_ERROR, "").into_response();
+            if let Ok(mut failed) = config.failed_subtitles.lock() {
+                failed.insert(track.id);
+            }
+            return (StatusCode::NOT_FOUND, "").into_response();
         }
     };
     let Ok(text) = tokio::fs::read_to_string(&path).await else {
@@ -520,7 +549,9 @@ fn transcode_response(config: &ServerConfig, start: Option<f64>) -> Response {
     let Some(stdout) = child.stdout.take() else {
         return (StatusCode::INTERNAL_SERVER_ERROR, "").into_response();
     };
-    let shutdown = config.shutdown.clone();
+    // Cancelled by a server shutdown, or when newer streams push this one out.
+    let cancel = config.shutdown.child_token();
+    admit_transcode(&config.live_transcodes, &cancel);
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(Duration::from_millis(200));
         loop {
@@ -530,12 +561,14 @@ fn transcode_response(config: &ServerConfig, start: Option<f64>) -> Response {
                         break;
                     }
                 }
-                () = shutdown.cancelled() => {
+                () = cancel.cancelled() => {
                     let _ = child.kill().await;
                     break;
                 }
             }
         }
+        // Frees this stream's slot.
+        cancel.cancel();
     });
     let body = Body::from_stream(ReaderStream::with_capacity(stdout, BUFSIZE_HINT));
     dlna_headers(
@@ -545,6 +578,25 @@ fn transcode_response(config: &ServerConfig, start: Option<f64>) -> Response {
     )
     .body(body)
     .expect("static response")
+}
+
+/// Registers a new live stream, ending the oldest ones beyond
+/// [`MAX_LIVE_TRANSCODES`].
+fn admit_transcode(
+    live: &std::sync::Mutex<std::collections::VecDeque<CancellationToken>>,
+    cancel: &CancellationToken,
+) {
+    let Ok(mut live) = live.lock() else {
+        return;
+    };
+    live.retain(|token| !token.is_cancelled());
+    live.push_back(cancel.clone());
+    while live.len() > MAX_LIVE_TRANSCODES {
+        if let Some(oldest) = live.pop_front() {
+            tracing::info!("ending the oldest ffmpeg stream to make room");
+            oldest.cancel();
+        }
+    }
 }
 
 /// Response head for a live ffmpeg stream: unseekable, one connection per
@@ -690,6 +742,10 @@ mod tests {
         (server, port, directory)
     }
 
+    fn loopback() -> Vec<IpAddr> {
+        vec!["127.0.0.1".parse().expect("loopback")]
+    }
+
     fn sample() -> Vec<u8> {
         (0..=255_u8).cycle().take(1000).collect()
     }
@@ -697,7 +753,7 @@ mod tests {
     #[tokio::test]
     async fn serves_files_and_ranges() {
         let content = sample();
-        let (server, port, directory) = test_server(&content, Vec::new(), Vec::new()).await;
+        let (server, port, directory) = test_server(&content, loopback(), Vec::new()).await;
         let base = format!("http://127.0.0.1:{port}");
         let client = reqwest::Client::new();
 
@@ -785,7 +841,7 @@ mod tests {
         }
         let srt =
             "1\n00:00:05,000 --> 00:00:08,000\nGone\n\n2\n00:00:20,000 --> 00:00:25,000\nKept\n";
-        let (server, port, directory) = test_server(&sample(), Vec::new(), vec![(1, srt)]).await;
+        let (server, port, directory) = test_server(&sample(), loopback(), vec![(1, srt)]).await;
         let base = format!("http://127.0.0.1:{port}");
         let client = reqwest::Client::new();
 
@@ -843,6 +899,38 @@ mod tests {
         assert_eq!(response.status(), 403);
         server.stop().await;
         let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[tokio::test]
+    async fn empty_allowlist_admits_nobody() {
+        let (server, port, directory) = test_server(&sample(), Vec::new(), Vec::new()).await;
+        let response = reqwest::Client::new()
+            .get(format!("http://127.0.0.1:{port}/tok/sample.mp4"))
+            .send()
+            .await
+            .expect("request");
+        assert_eq!(response.status(), 403);
+        server.stop().await;
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn live_transcodes_are_capped() {
+        let live = std::sync::Mutex::new(std::collections::VecDeque::new());
+        let streams: Vec<CancellationToken> = (0..4).map(|_| CancellationToken::new()).collect();
+        for stream in &streams {
+            admit_transcode(&live, stream);
+        }
+        assert!(streams[0].is_cancelled());
+        assert!(streams[1].is_cancelled());
+        assert!(!streams[2].is_cancelled());
+        assert!(!streams[3].is_cancelled());
+        // A stream that ended on its own frees its slot.
+        streams[3].cancel();
+        let next = CancellationToken::new();
+        admit_transcode(&live, &next);
+        assert!(!streams[2].is_cancelled());
+        assert!(!next.is_cancelled());
     }
 
     #[test]

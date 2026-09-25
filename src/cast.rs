@@ -1,3 +1,4 @@
+use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::Path;
 use std::sync::{Arc, RwLock};
@@ -18,6 +19,7 @@ use serde_json::json;
 
 use crate::daemon::Event;
 use crate::state::{Session, SessionState};
+use crate::util;
 
 #[derive(Debug)]
 struct AcceptAnyCertificate;
@@ -646,7 +648,8 @@ fn run_session(
         .to_owned();
     let connection = ClientConnection::new(Arc::new(config), server_name)
         .map_err(|error| format!("TLS setup failed: {error}"))?;
-    let stream = StreamOwned::new(connection, tcp);
+    let budget = FrameBudget::new();
+    let stream = FrameLimit::new(StreamOwned::new(connection, tcp), budget.clone());
 
     let manager = Arc::new(MessageManager::new(stream));
     let connection_channel = ConnectionChannel::new("sender-0", Arc::clone(&manager));
@@ -833,6 +836,7 @@ fn run_session(
         if is_stale(state, session_id) {
             return Ok(());
         }
+        budget.reset();
         let incoming = receive(&manager, &connection_channel, &heartbeat, &media, &receiver);
         // Only a run of failures means the link is gone; an odd message the
         // library cannot parse over a two-hour film must not end the session.
@@ -934,12 +938,136 @@ fn run_session(
     Ok(())
 }
 
-type Manager = Arc<MessageManager<StreamOwned<ClientConnection, TcpStream>>>;
-type Connection<'a> = ConnectionChannel<'a, StreamOwned<ClientConnection, TcpStream>>;
-type MediaChan<'a> =
-    rust_cast::channels::media::MediaChannel<'a, StreamOwned<ClientConnection, TcpStream>>;
-type Receiver<'a> = ReceiverChannel<'a, StreamOwned<ClientConnection, TcpStream>>;
-type Heartbeat<'a> = HeartbeatChannel<'a, StreamOwned<ClientConnection, TcpStream>>;
+/// Largest CASTV2 message accepted from a receiver. The protocol caps
+/// messages at 64 KiB; real `MEDIA_STATUS` replies are a few KiB.
+const MAX_CAST_FRAME: u32 = 64 * 1024;
+/// Messages a `rust_cast` helper may read while waiting for its reply. It
+/// keeps every message it is not waiting for, so this bounds that buffer
+/// (at most 16 MiB) and a handshake sees a few dozen at most.
+const MAX_UNCLAIMED_FRAMES: u32 = 256;
+/// How long a `rust_cast` helper may keep reading unrelated messages. Each
+/// message restarts the socket's read timeout, so without this a receiver
+/// could keep a wait going forever.
+const MAX_UNCLAIMED_WAIT: Duration = Duration::from_secs(30);
+
+/// Counts the frames read since the session loop last took a message.
+/// The loop calls [`FrameBudget::reset`] before each receive; anything
+/// reading past the limits in between is a `rust_cast` helper stuck behind a
+/// flood of messages it does not want.
+#[derive(Clone)]
+pub struct FrameBudget(Arc<std::sync::Mutex<(u32, Instant)>>);
+
+impl FrameBudget {
+    fn new() -> Self {
+        Self(Arc::new(std::sync::Mutex::new((0, Instant::now()))))
+    }
+
+    pub fn reset(&self) {
+        if let Ok(mut guard) = self.0.lock() {
+            *guard = (0, Instant::now());
+        }
+    }
+
+    fn note_frame(&self) -> bool {
+        let Ok(mut guard) = self.0.lock() else {
+            return false;
+        };
+        guard.0 = guard.0.saturating_add(1);
+        guard.0 <= MAX_UNCLAIMED_FRAMES && (guard.0 <= 1 || guard.1.elapsed() <= MAX_UNCLAIMED_WAIT)
+    }
+}
+
+/// Sits between `rust_cast` and the TLS stream and checks each frame's 4-byte
+/// big-endian length prefix. `rust_cast` pre-allocates whatever length the
+/// receiver announces (up to 4 GiB), so an oversized prefix is refused here,
+/// before it gets that far; so is a frame past the [`FrameBudget`]. After a
+/// refusal the stream stays failed: its framing can no longer be trusted.
+pub struct FrameLimit<S> {
+    inner: S,
+    budget: FrameBudget,
+    header: [u8; 4],
+    header_len: usize,
+    body_left: u32,
+    failed: bool,
+}
+
+impl<S> FrameLimit<S> {
+    fn new(inner: S, budget: FrameBudget) -> Self {
+        Self {
+            inner,
+            budget,
+            header: [0; 4],
+            header_len: 0,
+            body_left: 0,
+            failed: false,
+        }
+    }
+}
+
+impl<S: Read> Read for FrameLimit<S> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.failed {
+            return Err(frame_too_large());
+        }
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        if self.body_left > 0 {
+            let want = buf.len().min(self.body_left as usize);
+            let read = self.inner.read(&mut buf[..want])?;
+            // `read <= want <= body_left`, so this fits in a u32.
+            self.body_left -= u32::try_from(read).unwrap_or(self.body_left);
+            return Ok(read);
+        }
+        // Between frames: hand out at most the rest of the length prefix.
+        let want = buf.len().min(4 - self.header_len);
+        let read = self.inner.read(&mut buf[..want])?;
+        self.header[self.header_len..self.header_len + read].copy_from_slice(&buf[..read]);
+        self.header_len += read;
+        if self.header_len == 4 {
+            self.header_len = 0;
+            let length = u32::from_be_bytes(self.header);
+            if length > MAX_CAST_FRAME {
+                tracing::warn!("receiver sent a {length}-byte cast message; closing");
+                self.failed = true;
+                return Err(frame_too_large());
+            }
+            if !self.budget.note_frame() {
+                tracing::warn!(
+                    "receiver flooded the cast channel with unrelated messages; closing"
+                );
+                self.failed = true;
+                return Err(frame_too_large());
+            }
+            self.body_left = length;
+        }
+        Ok(read)
+    }
+}
+
+impl<S: Write> Write for FrameLimit<S> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.inner.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+fn frame_too_large() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        "cast channel exceeded its message limits",
+    )
+}
+
+type CastStream = FrameLimit<StreamOwned<ClientConnection, TcpStream>>;
+type Manager = Arc<MessageManager<CastStream>>;
+type Connection<'a> = ConnectionChannel<'a, CastStream>;
+type MediaChan<'a> = rust_cast::channels::media::MediaChannel<'a, CastStream>;
+type Receiver<'a> = ReceiverChannel<'a, CastStream>;
+type Heartbeat<'a> = HeartbeatChannel<'a, CastStream>;
 
 fn receive(
     manager: &Manager,
@@ -1075,12 +1203,12 @@ fn publish_status(
             },
         }
         if let Some(position) = current_time {
-            session.position = f64::from(position) + position_offset;
+            session.position = util::media_seconds(f64::from(position)) + position_offset;
         }
         if let Some(duration) = duration
             && session.duration <= 0.0
         {
-            session.duration = f64::from(duration);
+            session.duration = util::media_seconds(f64::from(duration));
         }
     });
     ended
@@ -1232,6 +1360,79 @@ mod tests {
                 );
             }
             other => panic!("unexpected parse result: {other:?}"),
+        }
+    }
+
+    fn frame(length: u32, body: &[u8]) -> Vec<u8> {
+        let mut bytes = length.to_be_bytes().to_vec();
+        bytes.extend_from_slice(body);
+        bytes
+    }
+
+    #[test]
+    fn frame_limit_passes_normal_messages() {
+        let mut wire = frame(5, b"hello");
+        wire.extend(frame(0, b""));
+        wire.extend(frame(3, b"abc"));
+        let mut stream = FrameLimit::new(std::io::Cursor::new(wire.clone()), FrameBudget::new());
+        let mut out = Vec::new();
+        stream.read_to_end(&mut out).expect("frames pass");
+        assert_eq!(out, wire);
+    }
+
+    #[test]
+    fn frame_limit_refuses_oversized_prefix() {
+        let mut wire = frame(5, b"hello");
+        wire.extend(frame(u32::MAX, b"xxxx"));
+        let mut stream = FrameLimit::new(std::io::Cursor::new(wire), FrameBudget::new());
+        let mut header = [0u8; 4];
+        let mut body = [0u8; 5];
+        stream.read_exact(&mut header).expect("first header");
+        stream.read_exact(&mut body).expect("first body");
+        let error = stream.read_exact(&mut header).expect_err("oversized frame");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        // The stream stays failed afterwards.
+        assert!(stream.read(&mut body).is_err());
+    }
+
+    #[test]
+    fn frame_limit_handles_split_prefix() {
+        // A prefix that arrives one byte at a time is still checked.
+        struct OneByte(std::io::Cursor<Vec<u8>>);
+        impl Read for OneByte {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let end = buf.len().min(1);
+                self.0.read(&mut buf[..end])
+            }
+        }
+        let wire = frame(MAX_CAST_FRAME + 1, b"");
+        let mut stream = FrameLimit::new(OneByte(std::io::Cursor::new(wire)), FrameBudget::new());
+        let mut header = [0u8; 4];
+        assert!(stream.read_exact(&mut header).is_err());
+    }
+
+    #[test]
+    fn frame_budget_caps_unclaimed_messages() {
+        let wire: Vec<u8> = (0..=MAX_UNCLAIMED_FRAMES)
+            .flat_map(|_| frame(1, b"x"))
+            .collect();
+        let budget = FrameBudget::new();
+        let mut stream = FrameLimit::new(std::io::Cursor::new(wire), budget.clone());
+        let mut message = [0u8; 5];
+        for _ in 0..MAX_UNCLAIMED_FRAMES {
+            stream.read_exact(&mut message).expect("within budget");
+        }
+        assert!(stream.read_exact(&mut message).is_err());
+
+        // The session loop resets the count before each message it takes.
+        let wire: Vec<u8> = (0..MAX_UNCLAIMED_FRAMES * 2)
+            .flat_map(|_| frame(1, b"x"))
+            .collect();
+        let budget = FrameBudget::new();
+        let mut stream = FrameLimit::new(std::io::Cursor::new(wire), budget.clone());
+        for _ in 0..MAX_UNCLAIMED_FRAMES * 2 {
+            budget.reset();
+            stream.read_exact(&mut message).expect("loop resets");
         }
     }
 

@@ -25,6 +25,15 @@ pub const PROBE_PATHS: [&str; 8] = [
     "/xml/device_description.xml",
 ];
 
+/// SSDP replies come from any host on the LAN, so what one scan accepts is
+/// bounded: a few description URLs per replying host, a few dozen overall.
+const MAX_LOCATIONS_PER_HOST: usize = 4;
+const MAX_LOCATIONS: usize = 64;
+/// Description fetches and renderer probes that run at once.
+const MAX_PARALLEL_PROBES: usize = 8;
+/// Upper bound on the probing half of a scan, however many hosts answered.
+const PROBE_DEADLINE: Duration = Duration::from_secs(15);
+
 fn msearch(st: &str) -> Vec<u8> {
     format!(
         "M-SEARCH * HTTP/1.1\r\nHOST: {SSDP_ADDR}:{SSDP_PORT}\r\nMAN: \"ssdp:discover\"\r\nMX: 2\r\nST: {st}\r\n\r\n"
@@ -45,6 +54,7 @@ fn new_socket(lan_ip: Ipv4Addr) -> std::io::Result<UdpSocket> {
 fn collect_locations(socket: &UdpSocket, window: Duration) -> HashSet<String> {
     let deadline = Instant::now() + window;
     let mut locations = HashSet::new();
+    let mut per_host: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     let mut buffer = [0_u8; 4096];
     while Instant::now() < deadline {
         match socket.recv_from(&mut buffer) {
@@ -58,7 +68,15 @@ fn collect_locations(socket: &UdpSocket, window: Duration) -> HashSet<String> {
                             // A device describes itself: a Location pointing
                             // anywhere but the replying host (localhost, a
                             // router admin page) is dropped.
-                            if !value.is_empty() && host_of(&value).as_deref() == Some(&sender) {
+                            if value.is_empty()
+                                || host_of(&value).as_deref() != Some(&sender)
+                                || locations.contains(&value)
+                            {
+                                continue;
+                            }
+                            let count = per_host.entry(sender.clone()).or_default();
+                            if *count < MAX_LOCATIONS_PER_HOST && locations.len() < MAX_LOCATIONS {
+                                *count += 1;
                                 locations.insert(value);
                             }
                         }
@@ -90,16 +108,24 @@ pub fn ssdp_multicast(lan_ip: Ipv4Addr) -> HashSet<String> {
     locations
 }
 
-pub fn ssdp_unicast(ip: &str, lan_ip: Ipv4Addr) -> HashSet<String> {
+/// Asks each candidate directly (for networks that drop multicast). One
+/// socket and one listening window serve every candidate, so the cost does
+/// not grow with the number of hosts.
+pub fn ssdp_unicast(ips: &[String], lan_ip: Ipv4Addr) -> HashSet<String> {
     let mut locations = HashSet::new();
+    if ips.is_empty() {
+        return locations;
+    }
     let Ok(socket) = new_socket(lan_ip) else {
         return locations;
     };
-    for st in [MEDIARENDERER, "ssdp:all"] {
-        let _ = socket.send_to(&msearch(st), (ip, SSDP_PORT));
+    for ip in ips {
+        for st in [MEDIARENDERER, "ssdp:all"] {
+            let _ = socket.send_to(&msearch(st), (ip.as_str(), SSDP_PORT));
+        }
     }
     for location in collect_locations(&socket, Duration::from_secs(2)) {
-        if host_of(&location).as_deref() == Some(ip) {
+        if host_of(&location).is_some_and(|host| ips.contains(&host)) {
             locations.insert(location);
         }
     }
@@ -122,25 +148,14 @@ fn client() -> &'static reqwest::Client {
     })
 }
 
-const MAX_DESCRIPTION_BYTES: u64 = 1024 * 1024;
+/// Device descriptions are a few KiB; SOAP replies (`GetPositionInfo` carries
+/// the DIDL metadata) stay well under 64 KiB on every renderer seen so far.
+const MAX_DESCRIPTION_BYTES: usize = 1024 * 1024;
+const MAX_SOAP_BYTES: usize = 256 * 1024;
 
 async fn http_get_text(url: &str, timeout: Duration) -> Option<String> {
-    let mut response = client().get(url).timeout(timeout).send().await.ok()?;
-    if response
-        .content_length()
-        .is_some_and(|length| length > MAX_DESCRIPTION_BYTES)
-    {
-        return None;
-    }
-    // Content-Length is optional (chunked replies), so enforce the cap while
-    // reading as well.
-    let mut body = Vec::new();
-    while let Some(chunk) = response.chunk().await.ok()? {
-        body.extend_from_slice(&chunk);
-        if body.len() as u64 > MAX_DESCRIPTION_BYTES {
-            return None;
-        }
-    }
+    let response = client().get(url).timeout(timeout).send().await.ok()?;
+    let body = util::read_body_capped(response, MAX_DESCRIPTION_BYTES).await?;
     Some(String::from_utf8_lossy(&body).into_owned())
 }
 
@@ -157,9 +172,7 @@ pub async fn discover(
             if use_multicast {
                 all.extend(ssdp_multicast(lan));
             }
-            for ip in &candidates {
-                all.extend(ssdp_unicast(ip, lan));
-            }
+            all.extend(ssdp_unicast(&candidates, lan));
         }
         all
     })
@@ -167,24 +180,54 @@ pub async fn discover(
     .unwrap_or_default();
 
     let mut devices: std::collections::HashMap<String, Device> = std::collections::HashMap::new();
+    let limit = std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_PARALLEL_PROBES));
+    let deadline = tokio::time::Instant::now() + PROBE_DEADLINE;
     let mut set = tokio::task::JoinSet::new();
     for location in locations {
-        set.spawn(async move { device_from_location(&location).await });
+        let limit = std::sync::Arc::clone(&limit);
+        set.spawn(async move {
+            let _permit = limit.acquire_owned().await.ok()?;
+            device_from_location(&location).await
+        });
     }
-    while let Some(result) = set.join_next().await {
-        if let Ok(Some(device)) = result {
-            devices.insert(device.ip.clone(), device);
-        }
-    }
+    collect_devices(&mut set, deadline, &mut devices).await;
 
     for ip in candidate_ips {
-        if !devices.contains_key(ip) {
-            if let Some(device) = probe_ip(ip).await {
-                devices.insert(ip.clone(), device);
+        if devices.contains_key(ip) {
+            continue;
+        }
+        let limit = std::sync::Arc::clone(&limit);
+        let ip = ip.clone();
+        set.spawn(async move {
+            let _permit = limit.acquire_owned().await.ok()?;
+            probe_ip(&ip).await
+        });
+    }
+    collect_devices(&mut set, deadline, &mut devices).await;
+    devices.into_values().collect()
+}
+
+/// Gathers finished probes until the set is empty or the scan's deadline
+/// passes; whatever is still running then is dropped (and aborted with it).
+async fn collect_devices(
+    set: &mut tokio::task::JoinSet<Option<Device>>,
+    deadline: tokio::time::Instant,
+    devices: &mut std::collections::HashMap<String, Device>,
+) {
+    loop {
+        match tokio::time::timeout_at(deadline, set.join_next()).await {
+            Ok(Some(Ok(Some(device)))) => {
+                devices.entry(device.ip.clone()).or_insert(device);
+            }
+            Ok(Some(_)) => {}
+            Ok(None) => return,
+            Err(_) => {
+                tracing::debug!("discovery deadline reached; {} probes dropped", set.len());
+                set.abort_all();
+                return;
             }
         }
     }
-    devices.into_values().collect()
 }
 
 async fn device_from_location(location: &str) -> Option<Device> {
@@ -424,7 +467,11 @@ pub async fn soap_service(
     match response {
         Ok(response) => {
             let status = response.status().as_u16();
-            let text = response.text().await.unwrap_or_default();
+            // An oversized reply reads as empty, i.e. as a failed action.
+            let text = util::read_body_capped(response, MAX_SOAP_BYTES)
+                .await
+                .map(|body| String::from_utf8_lossy(&body).into_owned())
+                .unwrap_or_default();
             (status, text)
         }
         Err(_) => (0, String::new()),
@@ -574,6 +621,37 @@ fn first_tag(xml: &str, tag: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ssdp_replies_are_capped_per_host() {
+        let listener = UdpSocket::bind("127.0.0.1:0").expect("bind");
+        listener
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .expect("timeout");
+        let sender = UdpSocket::bind("127.0.0.1:0").expect("bind sender");
+        let target = listener.local_addr().expect("addr");
+        for port in 0..50 {
+            let reply = format!(
+                "HTTP/1.1 200 OK\r\nLOCATION: http://127.0.0.1:{}/desc.xml\r\n\r\n",
+                1000 + port
+            );
+            sender.send_to(reply.as_bytes(), target).expect("send");
+        }
+        // Pointing somewhere other than the replying host is never accepted.
+        sender
+            .send_to(
+                b"HTTP/1.1 200 OK\r\nLOCATION: http://10.1.1.1/desc.xml\r\n\r\n",
+                target,
+            )
+            .expect("send");
+        let locations = collect_locations(&listener, Duration::from_millis(500));
+        assert_eq!(locations.len(), MAX_LOCATIONS_PER_HOST);
+        assert!(
+            locations
+                .iter()
+                .all(|url| url.starts_with("http://127.0.0.1:"))
+        );
+    }
 
     #[test]
     fn description_parsing() {

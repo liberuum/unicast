@@ -2,6 +2,8 @@ use std::time::Duration;
 
 use plist::{Dictionary, Value};
 
+use crate::util;
+
 const USER_AGENT: &str = "MediaControl/1.0";
 const BINARY_PLIST: &str = "application/x-apple-binary-plist";
 
@@ -101,6 +103,9 @@ pub async fn seek(ip: &str, port: u16, seconds: f64) {
         .await;
 }
 
+/// `/playback-info` is a small plist (position, duration, rate, a few flags).
+const MAX_PLAYBACK_INFO_BYTES: usize = 64 * 1024;
+
 pub async fn playback_info(ip: &str, port: u16) -> Option<PlaybackInfo> {
     let response = client()
         .get(format!("http://{ip}:{port}/playback-info"))
@@ -112,14 +117,14 @@ pub async fn playback_info(ip: &str, port: u16) -> Option<PlaybackInfo> {
     if !response.status().is_success() {
         return None;
     }
-    let bytes = response.bytes().await.ok()?;
-    let value = Value::from_reader(std::io::Cursor::new(bytes.as_ref())).ok()?;
+    let bytes = util::read_body_capped(response, MAX_PLAYBACK_INFO_BYTES).await?;
+    let value = Value::from_reader(std::io::Cursor::new(bytes.as_slice())).ok()?;
     let dictionary = value.as_dictionary()?;
     if dictionary.get("error").is_some() {
         return None;
     }
-    let position = real(dictionary, "position");
-    let duration = real(dictionary, "duration");
+    let position = util::media_seconds(real(dictionary, "position"));
+    let duration = util::media_seconds(real(dictionary, "duration"));
     let rate = real(dictionary, "rate");
     Some(PlaybackInfo {
         position,

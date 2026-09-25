@@ -10,6 +10,27 @@ use std::path::{Path, PathBuf};
 pub const DEFAULT_CAST_PORT: u16 = 60020;
 pub const DISCOVER_TTL: std::time::Duration = std::time::Duration::from_secs(20);
 
+/// Reads an HTTP response body, giving up once it grows past `max` bytes.
+/// Receivers are untrusted LAN devices: a hostile or broken one must not be
+/// able to make the daemon buffer an endless reply. Content-Length is optional
+/// (chunked replies), so the cap is enforced while reading as well.
+pub async fn read_body_capped(mut response: reqwest::Response, max: usize) -> Option<Vec<u8>> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > max as u64)
+    {
+        return None;
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.ok()? {
+        if body.len() + chunk.len() > max {
+            return None;
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Some(body)
+}
+
 pub fn home() -> PathBuf {
     env::var_os("HOME").map_or_else(|| PathBuf::from("."), PathBuf::from)
 }
@@ -112,6 +133,19 @@ pub fn resolve_ip(host: &str) -> String {
         .map_or_else(|| host.to_string(), |addr| addr.ip().to_string())
 }
 
+/// Longest plausible media position, in seconds (about 11 days).
+pub const MAX_MEDIA_SECONDS: f64 = 1_000_000.0;
+
+/// A position or duration reported by a receiver, or 0 when it is not a
+/// usable number (NaN, infinite, negative or absurdly large).
+pub fn media_seconds(value: f64) -> f64 {
+    if value.is_finite() && (0.0..=MAX_MEDIA_SECONDS).contains(&value) {
+        value
+    } else {
+        0.0
+    }
+}
+
 pub fn hms(value: &str) -> f64 {
     let parts: Vec<&str> = value.trim().split(':').collect();
     if parts.is_empty() || parts.len() > 3 {
@@ -124,7 +158,7 @@ pub fn hms(value: &str) -> f64 {
             Err(_) => return 0.0,
         }
     }
-    seconds
+    media_seconds(seconds)
 }
 
 pub fn mime_for_dlna(path: &str) -> String {
@@ -300,6 +334,9 @@ mod tests {
         assert!((hms("12:30") - 750.0).abs() < f64::EPSILON);
         assert!((hms("5") - 5.0).abs() < f64::EPSILON);
         assert!((hms("bogus") - 0.0).abs() < f64::EPSILON);
+        for bogus in ["inf", "NaN", "-5", "1e308", "99999999:00:00"] {
+            assert!(hms(bogus).abs() < f64::EPSILON, "{bogus}");
+        }
     }
 
     #[test]

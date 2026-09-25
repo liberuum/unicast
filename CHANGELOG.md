@@ -10,6 +10,28 @@
   (dialogue-forward), with or without audio boost.
 - Receiver errors that end a Cast session are now logged.
 
+### Security
+
+Hardening against a hostile or broken device on the LAN (marketplace review
+of 0.1.2):
+
+- DLNA SOAP replies and AirPlay `/playback-info` are read with size caps
+  (256 KiB / 64 KiB) instead of being buffered whole; device descriptions
+  already had a 1 MiB cap.
+- Google Cast: frames over 64 KiB are refused before `rust_cast` allocates
+  for them, and a receiver flooding the channel with unrelated messages
+  (256 frames / 30 s while a reply is awaited) ends the session instead of
+  growing an unbounded buffer.
+- The media server admits nobody when its allowlist is empty (fail closed),
+  runs at most two live ffmpeg streams per session (the oldest is ended to
+  make room), and stops retrying subtitle tracks ffmpeg already failed on.
+- Discovery accepts at most 4 SSDP description URLs per replying host and
+  64 per scan, 32 mDNS receivers per scan, probes at most 8 hosts at once
+  under a 15 s deadline, and ignores mDNS addresses outside private and
+  link-local ranges (no probes to loopback or the internet).
+- Positions and durations reported by receivers must be finite and under
+  1 000 000 s; anything else reads as 0.
+
 ## 0.1.2 — 2026-09-25
 
 ### Fixed
