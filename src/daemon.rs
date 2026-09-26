@@ -1371,7 +1371,7 @@ async fn dlna_poll(
         let (duration, position) = dlna::position_info(&control).await;
         // Volume is cheap to read but rarely changes; every third tick is plenty.
         let volume = match rendering.as_deref() {
-            Some(rendering) if ticks % 3 == 0 => (
+            Some(rendering) if ticks.is_multiple_of(3) => (
                 dlna::get_volume(rendering).await,
                 dlna::get_mute(rendering).await,
             ),

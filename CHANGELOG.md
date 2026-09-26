@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.1.3 — 2026-09-26
 
 ### Fixed
 
@@ -31,6 +31,11 @@ of 0.1.2):
   link-local ranges (no probes to loopback or the internet).
 - Positions and durations reported by receivers must be finite and under
   1 000 000 s; anything else reads as 0.
+
+### Changed
+
+- `plist` 1.10.1 and `time` 0.3.55 (drops a duplicate `quick-xml`);
+  `rust-version` now matches the pinned 1.98 toolchain.
 
 ## 0.1.2 — 2026-09-25
 

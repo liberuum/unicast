@@ -907,7 +907,7 @@ fn run_session(
         {
             last_poll = Instant::now();
             polls = polls.wrapping_add(1);
-            if polls % 5 == 0 {
+            if polls.is_multiple_of(5) {
                 let _ = timeout_handle.set_read_timeout(Some(GET_STATUS_TIMEOUT));
                 if let Ok(status) = receiver.get_status() {
                     publish_volume(state, session_id, &status.volume);

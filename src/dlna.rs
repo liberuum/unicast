@@ -62,23 +62,23 @@ fn collect_locations(socket: &UdpSocket, window: Duration) -> HashSet<String> {
                 let text = String::from_utf8_lossy(&buffer[..len]);
                 let sender = from.ip().to_string();
                 for line in text.split("\r\n") {
-                    if line.to_ascii_lowercase().starts_with("location:") {
-                        if let Some((_, value)) = line.split_once(':') {
-                            let value = value.trim().to_string();
-                            // A device describes itself: a Location pointing
-                            // anywhere but the replying host (localhost, a
-                            // router admin page) is dropped.
-                            if value.is_empty()
-                                || host_of(&value).as_deref() != Some(&sender)
-                                || locations.contains(&value)
-                            {
-                                continue;
-                            }
-                            let count = per_host.entry(sender.clone()).or_default();
-                            if *count < MAX_LOCATIONS_PER_HOST && locations.len() < MAX_LOCATIONS {
-                                *count += 1;
-                                locations.insert(value);
-                            }
+                    if line.to_ascii_lowercase().starts_with("location:")
+                        && let Some((_, value)) = line.split_once(':')
+                    {
+                        let value = value.trim().to_string();
+                        // A device describes itself: a Location pointing
+                        // anywhere but the replying host (localhost, a
+                        // router admin page) is dropped.
+                        if value.is_empty()
+                            || host_of(&value).as_deref() != Some(&sender)
+                            || locations.contains(&value)
+                        {
+                            continue;
+                        }
+                        let count = per_host.entry(sender.clone()).or_default();
+                        if *count < MAX_LOCATIONS_PER_HOST && locations.len() < MAX_LOCATIONS {
+                            *count += 1;
+                            locations.insert(value);
                         }
                     }
                 }
