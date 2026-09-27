@@ -86,6 +86,8 @@ struct ServeContext {
     device: Device,
     ip: String,
     path: String,
+    /// The file opened at connect; its bytes are what gets served.
+    pinned: Arc<util::PinnedFile>,
     bind: Ipv4Addr,
     port: u16,
     token: String,
@@ -125,7 +127,7 @@ impl ServeContext {
         if self.exact_seek {
             position
         } else {
-            cast::keyframe_at_or_before(Path::new(&self.path), position).unwrap_or(position)
+            cast::keyframe_at_or_before(&self.pinned.data_path(), position).unwrap_or(position)
         }
     }
 
@@ -431,13 +433,14 @@ impl Daemon {
         if !Path::new(&path).is_absolute() {
             return error_response("Give the full path to the file");
         }
-        if !Path::new(&path).is_file() {
-            return error_response("File not found");
-        }
+        let pinned = match util::PinnedFile::open(Path::new(&path)) {
+            Ok(pinned) => Arc::new(pinned),
+            Err(_) => return error_response("File not found"),
+        };
         // Any program on the session bus can claim to be a media player; only
         // cast what it reports if the file really is audio or video.
         if from_player {
-            let probe_path = PathBuf::from(&path);
+            let probe_path = pinned.data_path();
             let is_media = tokio::task::spawn_blocking(move || cast::has_media_stream(&probe_path))
                 .await
                 .unwrap_or(false);
@@ -512,7 +515,7 @@ impl Daemon {
         let token = util::random_token();
         let port = util::cast_port();
         let title = util::file_stem(&path);
-        let duration = cast::media_duration(Path::new(&path));
+        let duration = cast::media_duration(&pinned.data_path());
         let boost = settings::audio_boost();
         let subtitle_tracks = subtitles::discover(Path::new(&path));
         let subtitles_supported = protocol == "cast";
@@ -550,6 +553,7 @@ impl Daemon {
             device,
             ip: ip.clone(),
             path,
+            pinned,
             bind,
             port,
             token,
@@ -603,7 +607,7 @@ impl Daemon {
             IpAddr::V4(context.bind),
             context.port,
             ServeOptions {
-                file: PathBuf::from(&context.path),
+                file: Arc::clone(&context.pinned),
                 token: context.token.clone(),
                 allow,
                 transcode: plan.transcode.clone(),

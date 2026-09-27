@@ -2,7 +2,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::net::{Ipv4Addr, SocketAddr, TcpStream};
 use std::time::{Duration, Instant};
 
-use mdns_sd::{ResolvedService, ServiceDaemon, ServiceEvent};
+use mdns_sd::{IfKind, IfPredicate, ResolvedService, ServiceDaemon, ServiceEvent};
 
 use crate::dlna;
 use crate::protocol::Device;
@@ -30,7 +30,7 @@ pub async fn discover(
     manual_ips: &[String],
     use_multicast: bool,
 ) -> Vec<Device> {
-    let mdns = tokio::task::spawn_blocking(mdns_devices)
+    let mdns = tokio::task::spawn_blocking(move || mdns_devices(lan_ip))
         .await
         .unwrap_or_default();
     let mut candidates: Vec<String> = mdns.iter().map(|device| device.ip.clone()).collect();
@@ -54,10 +54,34 @@ pub async fn discover(
         .collect()
 }
 
-fn mdns_devices() -> Vec<Device> {
+/// Whether mDNS may use an interface address: the LAN address the route to
+/// the internet leaves from when that is a LAN address (not a full-tunnel
+/// VPN), otherwise any LAN IPv4. Never IPv6,
+/// loopback, a VPN (Tailscale's 100.64/10) or other non-private networks.
+fn mdns_interface_allowed(ip: std::net::IpAddr, lan_ip: Option<Ipv4Addr>) -> bool {
+    match (ip, lan_ip) {
+        (std::net::IpAddr::V4(ip), Some(lan)) if lan_address(lan) => ip == lan,
+        (std::net::IpAddr::V4(ip), _) => lan_address(ip),
+        (std::net::IpAddr::V6(_), _) => false,
+    }
+}
+
+fn mdns_devices(lan_ip: Option<Ipv4Addr>) -> Vec<Device> {
     let Ok(daemon) = ServiceDaemon::new() else {
         return Vec::new();
     };
+    // Selections apply in order, last match wins: drop every interface, then
+    // put back only the LAN one. Commands run before the browses below.
+    if daemon.disable_interface(IfKind::All).is_err()
+        || daemon
+            .enable_interface(IfKind::Predicate(IfPredicate::new(move |intf| {
+                mdns_interface_allowed(intf.ip(), lan_ip)
+            })))
+            .is_err()
+    {
+        let _ = daemon.shutdown();
+        return Vec::new();
+    }
     let mut receivers = Vec::new();
     if let Ok(receiver) = daemon.browse(CAST_SERVICE) {
         receivers.push(("cast", receiver));
@@ -286,6 +310,22 @@ mod tests {
         assert_eq!(merged[0].protocol, "dlna");
         assert_eq!(merged[0].name, "TV");
         assert_eq!(merged[0].alternates, vec!["cast".to_string()]);
+    }
+
+    #[test]
+    fn mdns_uses_only_the_lan_interface() {
+        let lan: Ipv4Addr = "192.168.1.6".parse().expect("ip");
+        let ip = |s: &str| s.parse::<std::net::IpAddr>().expect("ip");
+        assert!(mdns_interface_allowed(ip("192.168.1.6"), Some(lan)));
+        assert!(!mdns_interface_allowed(ip("172.17.0.1"), Some(lan)));
+        assert!(!mdns_interface_allowed(ip("100.101.1.2"), Some(lan)));
+        assert!(!mdns_interface_allowed(ip("fe80::1"), Some(lan)));
+        assert!(mdns_interface_allowed(ip("10.0.0.4"), None));
+        assert!(!mdns_interface_allowed(ip("100.101.1.2"), None));
+        assert!(!mdns_interface_allowed(ip("127.0.0.1"), None));
+        let tunnel: Ipv4Addr = "100.101.1.2".parse().expect("ip");
+        assert!(mdns_interface_allowed(ip("192.168.1.6"), Some(tunnel)));
+        assert!(!mdns_interface_allowed(ip("100.101.1.2"), Some(tunnel)));
     }
 
     #[test]

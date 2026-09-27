@@ -255,6 +255,39 @@ pub fn extension(path: &str) -> String {
         .map_or_else(String::new, |ext| ext.to_string_lossy().to_lowercase())
 }
 
+/// The media file of a cast, opened once when the cast starts. Everything that
+/// sends its bytes to the receiver reads this open file through
+/// [`PinnedFile::data_path`], never the original path again: if the path is
+/// swapped mid-cast (say, for a symlink in a shared folder), the receiver
+/// still gets the file the user chose, or nothing.
+#[derive(Debug)]
+pub struct PinnedFile {
+    file: fs::File,
+}
+
+impl PinnedFile {
+    pub fn open(path: &Path) -> std::io::Result<Self> {
+        let file = fs::File::open(path)?;
+        if !file.metadata()?.is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "not a regular file",
+            ));
+        }
+        Ok(Self { file })
+    }
+
+    /// `/proc/<daemon pid>/fd/<n>`: opens the pinned inode, with its own file
+    /// offset, from this process and from the ffmpeg/ffprobe it starts.
+    pub fn data_path(&self) -> PathBuf {
+        PathBuf::from(format!(
+            "/proc/{}/fd/{}",
+            std::process::id(),
+            self.file.as_raw_fd()
+        ))
+    }
+}
+
 /// ffmpeg/ffprobe input arguments for a local file: the `file:` prefix and
 /// the protocol whitelist stop a name or a playlist-shaped file from being
 /// opened as anything but a local file (no `http:`, `concat:`, `-option`).
@@ -391,6 +424,23 @@ mod tests {
         ] {
             assert_eq!(valid_receiver_ip(bad), None, "{bad}");
         }
+    }
+
+    #[test]
+    fn pinned_file_survives_a_path_swap() {
+        let dir = std::env::temp_dir().join(format!("unicast-pin-{}", random_token()));
+        fs::create_dir_all(&dir).expect("dir");
+        let media = dir.join("movie.mkv");
+        fs::write(&media, b"the chosen movie").expect("write");
+        let pinned = PinnedFile::open(&media).expect("pin");
+        fs::remove_file(&media).expect("remove");
+        fs::write(&media, b"a swapped-in secret").expect("swap");
+        assert_eq!(
+            fs::read(pinned.data_path()).expect("read"),
+            b"the chosen movie"
+        );
+        assert!(PinnedFile::open(&dir).is_err());
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

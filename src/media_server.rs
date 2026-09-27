@@ -97,7 +97,8 @@ impl TranscodePlan {
 
 /// What one media server instance serves.
 pub struct ServeOptions {
-    pub file: PathBuf,
+    /// The media file, pinned at connect; served through its descriptor.
+    pub file: Arc<util::PinnedFile>,
     pub token: String,
     pub allow: Vec<IpAddr>,
     pub transcode: Option<TranscodePlan>,
@@ -109,7 +110,11 @@ pub struct ServeOptions {
 }
 
 pub struct ServerConfig {
+    /// `/proc/<pid>/fd/<n>` of `pin`, never the user-visible path.
     pub file: PathBuf,
+    /// Keeps the descriptor behind `file` open while the server runs.
+    #[allow(dead_code)]
+    pub pin: Arc<util::PinnedFile>,
     pub token: String,
     pub allow: Vec<IpAddr>,
     pub transcode: Option<TranscodePlan>,
@@ -202,7 +207,8 @@ pub async fn start(
     let subtitle_dir = options.subtitle_dir.clone();
     let allow_at_accept = options.allow.clone();
     let config = Arc::new(ServerConfig {
-        file: options.file,
+        file: options.file.data_path(),
+        pin: options.file,
         token: options.token,
         allow: options.allow,
         transcode: options.transcode,
@@ -785,7 +791,7 @@ mod tests {
             "127.0.0.1".parse().expect("loopback"),
             0,
             ServeOptions {
-                file,
+                file: Arc::new(util::PinnedFile::open(&file).expect("pin")),
                 token: "tok".to_string(),
                 allow,
                 transcode: None,

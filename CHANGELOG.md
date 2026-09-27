@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.1.5 — 2026-09-27
+
+### Security
+
+The three lower-priority items left open in 0.1.4:
+
+- The media file is opened once at connect and everything that sends its
+  bytes (direct HTTP, the ffmpeg stream, embedded-subtitle extraction, seek
+  keyframe lookups) reads that descriptor through `/proc/<pid>/fd/<n>`.
+  Swapping the path for a symlink or another file mid-cast no longer changes
+  what the receiver gets.
+- mDNS browses only the LAN interface (the address the default route leaves
+  from, or any private IPv4 interface when that is a full-tunnel VPN); IPv6,
+  VPN, container and other interfaces are never used.
+- The user unit now runs with `UMask=0077`, `TasksMax=1024`, `MemoryMax=4G`,
+  `OOMScoreAdjust=200` and `KeyringMode=private`. Namespace and seccomp
+  sandboxing is deliberately left out, since in a user unit it implies
+  `PrivateUsers=`/`NoNewPrivileges=` and would disable the `pkexec ufw`
+  firewall prompt; a test keeps it that way. Re-run setup (or stop the unit)
+  for an existing install to pick up the new unit file.
+
 ## 0.1.4 — 2026-09-27
 
 ### Security

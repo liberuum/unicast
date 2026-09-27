@@ -9,6 +9,33 @@ use serde_json::{Value, json};
 use crate::util;
 
 const UNIT_NAME: &str = "omarchy-castd.service";
+
+const UNIT_HEAD: &str = "[Unit]
+Description=omarchy-cast media daemon
+
+[Service]
+Type=simple
+";
+
+/// Limits that hold in a user unit without disabling the daemon's one
+/// privileged step. systemd's namespace options (`ProtectSystem=`,
+/// `PrivateTmp=`, ...) imply `PrivateUsers=` there, and its seccomp options
+/// (`RestrictAddressFamilies=`, `MemoryDenyWriteExecute=`, ...) imply
+/// `NoNewPrivileges=`; either would stop `pkexec ufw` for the per-receiver
+/// firewall rule. What remains bounds the daemon and its ffmpeg children:
+/// private file modes, a task and memory ceiling, first in line for the OOM
+/// killer, and no access to the user's session keyring.
+const UNIT_TAIL: &str = "Restart=on-failure
+RestartSec=1
+UMask=0077
+TasksMax=1024
+MemoryMax=4G
+OOMScoreAdjust=200
+KeyringMode=private
+
+[Install]
+WantedBy=default.target
+";
 /// Longer than the slowest `connect`: probing, a polkit prompt for the
 /// firewall rule (up to 60 s) and two Cast attempts (25 s each). Giving up
 /// earlier reports an error while the daemon goes on and casts anyway.
@@ -112,7 +139,7 @@ fn systemctl(args: &[&str]) -> bool {
 
 fn install_unit(executable: &Path) -> bool {
     let unit = format!(
-        "[Unit]\nDescription=omarchy-cast media daemon\n\n[Service]\nType=simple\nExecStart=\"{}\"\nRestart=on-failure\nRestartSec=1\n\n[Install]\nWantedBy=default.target\n",
+        "{UNIT_HEAD}ExecStart=\"{}\"\n{UNIT_TAIL}",
         executable.display()
     );
     let directory = util::systemd_user_dir();
@@ -177,5 +204,39 @@ pub fn main(args: &[String]) {
             "{}",
             json!({"ok": false, "error": format!("cast service error: {error}")})
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unit_is_bounded_but_keeps_pkexec_usable() {
+        let unit = format!("{UNIT_HEAD}ExecStart=\"/usr/bin/omarchy-castd\"\n{UNIT_TAIL}");
+        for line in [
+            "UMask=0077",
+            "TasksMax=1024",
+            "MemoryMax=4G",
+            "OOMScoreAdjust=200",
+        ] {
+            assert!(unit.lines().any(|l| l == line), "{line}");
+        }
+        // Each of these implies NoNewPrivileges= or PrivateUsers= in a user
+        // unit, which would break the pkexec firewall prompt.
+        for option in [
+            "NoNewPrivileges",
+            "PrivateUsers",
+            "ProtectSystem",
+            "ProtectHome",
+            "PrivateTmp",
+            "RestrictAddressFamilies",
+            "SystemCallFilter",
+            "MemoryDenyWriteExecute",
+            "LockPersonality",
+            "RestrictNamespaces",
+        ] {
+            assert!(!unit.contains(option), "{option}");
+        }
     }
 }
