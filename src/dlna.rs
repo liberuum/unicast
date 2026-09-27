@@ -500,28 +500,52 @@ pub async fn soap_service(
     }
 }
 
-fn didl(url: &str, title: &str, mime: &str) -> String {
+/// DIDL-Lite metadata for `url`. With `caption`, the subtitle file is named
+/// the ways TVs look for it: Samsung's `sec:CaptionInfoEx`/`sec:CaptionInfo`
+/// and `smi/caption` resource, and a plain `text/srt` resource for the rest.
+/// The video resource stays first, since renderers take the first they play.
+fn didl(url: &str, title: &str, mime: &str, caption: Option<&str>) -> String {
     let class = if mime.starts_with("audio") {
         "object.item.audioItem.musicTrack"
     } else {
         "object.item.videoItem"
     };
+    let (namespace, subtitles) = caption.map_or((String::new(), String::new()), |caption| {
+        let caption = util::xml_escape(caption);
+        (
+            " xmlns:sec=\"http://www.sec.co.kr/\"".to_string(),
+            format!(
+                "<res protocolInfo=\"http-get:*:smi/caption:*\">{caption}</res>\
+                 <res protocolInfo=\"http-get:*:text/srt:*\">{caption}</res>\
+                 <sec:CaptionInfoEx sec:type=\"srt\">{caption}</sec:CaptionInfoEx>\
+                 <sec:CaptionInfo sec:type=\"srt\">{caption}</sec:CaptionInfo>"
+            ),
+        )
+    });
     format!(
         "<DIDL-Lite xmlns=\"urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/\" \
          xmlns:dc=\"http://purl.org/dc/elements/1.1/\" \
-         xmlns:upnp=\"urn:schemas-upnp-org:metadata-1-0/upnp/\">\
+         xmlns:upnp=\"urn:schemas-upnp-org:metadata-1-0/upnp/\"{namespace}>\
          <item id=\"0\" parentID=\"-1\" restricted=\"1\">\
          <dc:title>{}</dc:title><upnp:class>{class}</upnp:class>\
          <res protocolInfo=\"http-get:*:{mime}:DLNA.ORG_OP=01;DLNA.ORG_CI=0;\
          DLNA.ORG_FLAGS=01700000000000000000000000000000\">{}</res>\
-         </item></DIDL-Lite>",
+         {subtitles}</item></DIDL-Lite>",
         util::xml_escape(title),
         util::xml_escape(url)
     )
 }
 
-pub async fn play(control_url: &str, url: &str, title: &str, mime: &str) -> Result<(), String> {
-    let metadata = didl(url, title, mime);
+/// Loads `url` on the renderer and starts it, naming `caption` (an SRT URL)
+/// as its subtitles when given.
+pub async fn play(
+    control_url: &str,
+    url: &str,
+    title: &str,
+    mime: &str,
+    caption: Option<&str>,
+) -> Result<(), String> {
+    let metadata = didl(url, title, mime, caption);
     let args = format!(
         "<CurrentURI>{}</CurrentURI><CurrentURIMetaData>{}</CurrentURIMetaData>",
         util::xml_escape(url),
@@ -645,6 +669,30 @@ mod tests {
     use super::*;
 
     #[test]
+    fn didl_names_the_subtitle_for_samsung_and_generic_renderers() {
+        let url = "http://192.168.50.10:60020/tok/stream.ts?start=10&sub=2";
+        let caption = "http://192.168.50.10:60020/tok/sub/2.srt?start=10";
+        let metadata = didl(url, "A & B", "video/mp2t", Some(caption));
+        assert!(metadata.contains("xmlns:sec=\"http://www.sec.co.kr/\""));
+        let video = metadata.find("video/mp2t").expect("video res");
+        let subtitle = metadata.find("smi/caption").expect("caption res");
+        assert!(video < subtitle, "the video resource stays first");
+        assert!(metadata.contains(
+            "<res protocolInfo=\"http-get:*:smi/caption:*\">http://192.168.50.10:60020/tok/sub/2.srt?start=10</res>"
+        ));
+        assert!(metadata.contains(
+            "<res protocolInfo=\"http-get:*:text/srt:*\">http://192.168.50.10:60020/tok/sub/2.srt?start=10</res>"
+        ));
+        assert!(metadata.contains(
+            "<sec:CaptionInfoEx sec:type=\"srt\">http://192.168.50.10:60020/tok/sub/2.srt?start=10</sec:CaptionInfoEx>"
+        ));
+        assert!(metadata.contains("stream.ts?start=10&amp;sub=2</res>"));
+        assert!(metadata.contains("<dc:title>A &amp; B</dc:title>"));
+        let plain = didl(url, "t", "video/mp2t", None);
+        assert!(!plain.contains("caption") && !plain.contains("sec:") && !plain.contains("srt"));
+    }
+
+    #[test]
     fn ssdp_replies_from_off_the_lan_are_dropped() {
         let listener = UdpSocket::bind("127.0.0.1:0").expect("bind");
         listener
@@ -658,7 +706,7 @@ mod tests {
             )
             .expect("send");
         assert!(collect_locations(&listener, Duration::from_millis(400)).is_empty());
-        assert!(lan_sender("192.168.1.8".parse().expect("ip")));
+        assert!(lan_sender("192.168.50.20".parse().expect("ip")));
         for ip in ["100.64.0.1", "8.8.8.8", "127.0.0.1", "fe80::1"] {
             assert!(!lan_sender(ip.parse().expect("ip")), "{ip}");
         }
@@ -702,7 +750,7 @@ mod tests {
         <root xmlns="urn:schemas-upnp-org:device-1-0">
           <URLBase>http://192.168.1.50:9197/</URLBase>
           <device>
-            <friendlyName>Living Room TV</friendlyName>
+            <friendlyName>Den TV</friendlyName>
             <modelName>OLED55</modelName>
             <serviceList>
               <service>
@@ -717,7 +765,7 @@ mod tests {
           </device>
         </root>"#;
         let description = parse_description(xml, "http://192.168.1.50:9197/dd.xml");
-        assert_eq!(description.friendly.as_deref(), Some("Living Room TV"));
+        assert_eq!(description.friendly.as_deref(), Some("Den TV"));
         assert_eq!(description.model.as_deref(), Some("OLED55"));
         assert_eq!(
             description.control.as_deref(),

@@ -423,8 +423,8 @@ mod tests {
     #[test]
     fn receiver_ips_are_lan_ipv4_only() {
         assert_eq!(
-            valid_receiver_ip(" 192.168.1.8 "),
-            Some("192.168.1.8".into())
+            valid_receiver_ip(" 192.168.50.20 "),
+            Some("192.168.50.20".into())
         );
         assert_eq!(valid_receiver_ip("10.0.0.2"), Some("10.0.0.2".into()));
         assert_eq!(valid_receiver_ip("172.16.4.1"), Some("172.16.4.1".into()));
@@ -439,7 +439,7 @@ mod tests {
             "::1",
             "any",
             "10.0.0.0/8",
-            "192.168.1.8 port 22",
+            "192.168.50.20 port 22",
             "",
         ] {
             assert_eq!(valid_receiver_ip(bad), None, "{bad}");

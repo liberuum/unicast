@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.1.8 — 2026-09-27
+
+### Added
+
+- **Subtitles on DLNA TVs.** The subtitle picker now works when casting
+  straight to a TV. The chosen track is served as SRT and named with the
+  video the way TVs look for it: Samsung's `sec:CaptionInfoEx` in the
+  DIDL-Lite metadata and the `CaptionInfo.sec` response header, plus a
+  `text/srt` resource for other brands. It is re-timed after every seek, and
+  switching track reloads the video where it is. The remembered language is
+  picked at connect, as on Chromecast.
+
+### Fixed
+
+- **Seeking an ffmpeg stream opened with a silent gap.** With B-frame video
+  (x265, most x264), ffmpeg's input seek lands one keyframe before `-ss`, and
+  the copied video was kept from there while the re-encoded audio started at
+  `-ss`. Every seek stream opened with a whole keyframe interval (10 s on
+  some files) of video and no audio: some TVs then played it silent until
+  the volume was touched, and position and subtitles were off by that
+  interval. Copied packets before `-ss` are now dropped (`-copypriorss 0`),
+  so picture and sound both start at the keyframe asked for, and seeks start
+  faster. The keyframe time is rounded down, never up, to the millisecond.
+
 ## 0.1.7 — 2026-09-27
 
 ### Security
@@ -253,6 +277,4 @@ First public release of UniCast.
   WebVTT, switchable without reloading, choice remembered per language.
 - Immediate feedback for every panel interaction.
 
-Tested on Omarchy 4.0.3 / quickshell 0.3.1 / ffmpeg 9.0.1 with a Chromecast, a
-Samsung TU7000-series TV (DLNA) and an LG webOS TV (Cast). AirPlay is
-implemented but untested.
+AirPlay is implemented but untested.

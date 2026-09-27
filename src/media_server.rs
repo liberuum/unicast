@@ -125,6 +125,8 @@ pub struct ServerConfig {
     pub convert: tokio::sync::Mutex<()>,
     /// Subtitle tracks ffmpeg already failed to convert; not retried.
     pub failed_subtitles: std::sync::Mutex<std::collections::HashSet<u32>>,
+    /// `http://<bind>:<port>/<token>`, for URLs the server hands out itself.
+    pub base_url: String,
     /// One cancel handle per live ffmpeg stream, oldest first.
     pub live_transcodes: std::sync::Mutex<std::collections::VecDeque<CancellationToken>>,
     pub shutdown: CancellationToken,
@@ -206,7 +208,9 @@ pub async fn start(
     let shutdown = CancellationToken::new();
     let subtitle_dir = options.subtitle_dir.clone();
     let allow_at_accept = options.allow.clone();
+    let base_url = format!("http://{bind}:{bound_port}/{}", options.token);
     let config = Arc::new(ServerConfig {
+        base_url,
         file: options.file.data_path(),
         pin: options.file,
         token: options.token,
@@ -321,39 +325,60 @@ async fn handle(
     );
     let start = query
         .as_deref()
-        .and_then(parse_start_query)
+        .and_then(|query| query_value(query, "start"))
+        .and_then(|value| value.parse::<f64>().ok())
         .filter(|start| start.is_finite() && *start > 0.0 && *start <= util::MAX_MEDIA_SECONDS);
     if let Some(name) = rest.strip_prefix("sub/") {
         return match method {
             Method::GET => subtitle_response(&config, name, start).await,
-            Method::HEAD if subtitle_track(&config, name).is_some() => cors(
-                Response::builder()
-                    .status(StatusCode::OK)
-                    .header(header::CONTENT_TYPE, "text/vtt; charset=utf-8"),
-            )
-            .body(Body::empty())
-            .expect("static response"),
-            Method::HEAD => (StatusCode::NOT_FOUND, "").into_response(),
+            Method::HEAD => match subtitle_track(&config, name) {
+                Some((_, format)) => cors(
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header(header::CONTENT_TYPE, format.content_type()),
+                )
+                .body(Body::empty())
+                .expect("static response"),
+                None => (StatusCode::NOT_FOUND, "").into_response(),
+            },
             _ => (StatusCode::NOT_IMPLEMENTED, "").into_response(),
         };
     }
-    match method {
+    let mut response = match method {
         Method::HEAD => head_response(&config).await,
         Method::GET => get_response(&config, &headers, start).await,
-        _ => (StatusCode::NOT_IMPLEMENTED, "").into_response(),
-    }
-}
-
-fn parse_start_query(query: &str) -> Option<f64> {
-    for pair in query.split('&') {
-        let Some((key, value)) = pair.split_once('=') else {
-            continue;
-        };
-        if key == "start" {
-            return value.parse().ok();
+        _ => return (StatusCode::NOT_IMPLEMENTED, "").into_response(),
+    };
+    // Samsung TVs ask for the subtitle file on the media request itself
+    // (`getCaptionInfo.sec: 1`); the stream URL names the track as `sub=`.
+    let caption = query
+        .as_deref()
+        .and_then(|query| query_value(query, "sub"))
+        .and_then(|value| value.parse::<u32>().ok())
+        .filter(|id| config.subtitles.iter().any(|track| track.id == *id));
+    if let Some(id) = caption
+        && headers.contains_key("getcaptioninfo.sec")
+    {
+        let url = format!(
+            "{}/sub/{id}.srt{}",
+            config.base_url,
+            start.map_or(String::new(), |start| format!("?start={start}"))
+        );
+        if let Ok(value) = header::HeaderValue::from_str(&url) {
+            response
+                .headers_mut()
+                .insert(header::HeaderName::from_static("captioninfo.sec"), value);
         }
     }
-    None
+    response
+}
+
+/// The value of `key` in a URL query string, if present.
+fn query_value<'a>(query: &'a str, key: &str) -> Option<&'a str> {
+    query
+        .split('&')
+        .filter_map(|pair| pair.split_once('='))
+        .find_map(|(name, value)| (name == key).then_some(value))
 }
 
 fn forbidden() -> Response {
@@ -448,15 +473,49 @@ async fn get_response(config: &ServerConfig, headers: &HeaderMap, start: Option<
     file_response(config, headers.get(header::RANGE)).await
 }
 
-/// `/{token}/sub/{id}.vtt[?start=S]`: the track as `WebVTT`, converted on first
-/// use and re-timed when the receiver plays a stream that began `S` seconds in.
-fn subtitle_track<'a>(config: &'a ServerConfig, name: &str) -> Option<&'a SubtitleTrack> {
-    let id = name.strip_suffix(".vtt")?.parse::<u32>().ok()?;
-    config.subtitles.iter().find(|track| track.id == id)
+/// How a subtitle track is served: `WebVTT` for Cast receivers, `SubRip`
+/// for DLNA TVs.
+#[derive(Clone, Copy)]
+enum SubtitleFormat {
+    Vtt,
+    Srt,
+}
+
+impl SubtitleFormat {
+    fn content_type(self) -> &'static str {
+        match self {
+            Self::Vtt => "text/vtt; charset=utf-8",
+            Self::Srt => "text/srt",
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Vtt => "vtt",
+            Self::Srt => "srt",
+        }
+    }
+}
+
+/// `/{token}/sub/{id}.vtt[?start=S]` (or `.srt`): the track, converted on
+/// first use and re-timed when the receiver plays a stream that began `S`
+/// seconds in.
+fn subtitle_track<'a>(
+    config: &'a ServerConfig,
+    name: &str,
+) -> Option<(&'a SubtitleTrack, SubtitleFormat)> {
+    let (id, format) = if let Some(id) = name.strip_suffix(".vtt") {
+        (id, SubtitleFormat::Vtt)
+    } else {
+        (name.strip_suffix(".srt")?, SubtitleFormat::Srt)
+    };
+    let id = id.parse::<u32>().ok()?;
+    let track = config.subtitles.iter().find(|track| track.id == id)?;
+    Some((track, format))
 }
 
 async fn subtitle_response(config: &ServerConfig, name: &str, start: Option<f64>) -> Response {
-    let Some(track) = subtitle_track(config, name) else {
+    let Some((track, format)) = subtitle_track(config, name) else {
         return (StatusCode::NOT_FOUND, "").into_response();
     };
     let known_bad = |config: &ServerConfig| {
@@ -499,9 +558,14 @@ async fn subtitle_response(config: &ServerConfig, name: &str, start: Option<f64>
         Some(start) => subtitles::shift_vtt(&text, start),
         None => text,
     };
+    let body = match format {
+        SubtitleFormat::Vtt => body,
+        SubtitleFormat::Srt => subtitles::vtt_to_srt(&body),
+    };
     tracing::info!(
-        "subtitle track {} served: {} bytes{}",
+        "subtitle track {} served as {}: {} bytes{}",
         track.id,
+        format.name(),
         body.len(),
         start.map_or(String::new(), |start| format!(
             ", re-timed from {start:.1}s"
@@ -510,7 +574,7 @@ async fn subtitle_response(config: &ServerConfig, name: &str, start: Option<f64>
     cors(
         Response::builder()
             .status(StatusCode::OK)
-            .header(header::CONTENT_TYPE, "text/vtt; charset=utf-8")
+            .header(header::CONTENT_TYPE, format.content_type())
             .header(header::CACHE_CONTROL, "no-store")
             .header(header::CONTENT_LENGTH, body.len().to_string()),
     )
@@ -680,70 +744,90 @@ fn live_stream_builder(container: TranscodeContainer) -> Builder {
     }
 }
 
+/// ffmpeg arguments for one live stream of `file` (read through its pinned
+/// descriptor), written to stdout. `start` restarts it at that time.
+fn ffmpeg_args(file: &std::path::Path, plan: &TranscodePlan, start: Option<f64>) -> Vec<String> {
+    let vbitrate = std::env::var("OMARCHY_CAST_VBITRATE").unwrap_or_else(|_| "6000".to_string());
+    let vbitrate_value: u64 = vbitrate.parse().unwrap_or(6000);
+    let mut args: Vec<String> = ["-nostdin", "-loglevel", "error"]
+        .map(String::from)
+        .to_vec();
+    if let Some(start) = start {
+        args.extend(["-ss".to_string(), format!("{start:.3}")]);
+    }
+    args.extend(util::ffmpeg_input(file));
+    args.extend(["-map", "0:v:0", "-map", "0:a:0?"].map(String::from));
+    if plan.vcodec == "copy" {
+        args.extend(["-c:v", "copy"].map(String::from));
+        if start.is_some() {
+            // With B-frame video ffmpeg's input seek lands one keyframe before
+            // `-ss`, and by default copied packets from there are kept while
+            // re-encoded audio starts at `-ss`: the stream would open with a
+            // keyframe interval of video and no audio (a TV may then play it
+            // silent). Drop copied packets before `-ss` so both start at the
+            // keyframe `-ss` names.
+            args.extend(["-copypriorss", "0"].map(String::from));
+        }
+    } else {
+        args.extend(
+            [
+                "-vf",
+                "scale='min(1920,iw)':-2",
+                "-c:v",
+                &plan.vcodec,
+                "-preset",
+                "veryfast",
+                "-profile:v",
+                "high",
+                "-pix_fmt",
+                "yuv420p",
+                "-b:v",
+                &format!("{vbitrate}k"),
+                "-maxrate",
+                &format!("{vbitrate}k"),
+                "-bufsize",
+                &format!("{}k", vbitrate_value * 2),
+            ]
+            .map(String::from),
+        );
+    }
+    if let Some(filter) = plan.audio_filter() {
+        // Boosting or downmixing means re-encoding, whatever the source codec was.
+        args.extend(["-af", &filter, "-c:a", "aac", "-b:a", "192k", "-ac", "2"].map(String::from));
+    } else if plan.acodec == "copy" {
+        args.extend(["-c:a", "copy"].map(String::from));
+    } else {
+        args.extend(["-c:a", &plan.acodec, "-b:a", "192k", "-ac", "2"].map(String::from));
+    }
+    match plan.container {
+        TranscodeContainer::FragmentedMp4 => {
+            args.extend(
+                [
+                    "-movflags",
+                    "frag_keyframe+empty_moov+default_base_moof",
+                    "-f",
+                    "mp4",
+                ]
+                .map(String::from),
+            );
+        }
+        TranscodeContainer::MpegTs => {
+            // ffmpeg converts H.264/HEVC to Annex B and AAC to ADTS on its own.
+            args.extend(["-f", "mpegts"].map(String::from));
+        }
+    }
+    args.push("pipe:1".to_string());
+    args
+}
+
 fn spawn_ffmpeg(
     config: &ServerConfig,
     plan: &TranscodePlan,
     start: Option<f64>,
 ) -> std::io::Result<tokio::process::Child> {
-    let vbitrate = std::env::var("OMARCHY_CAST_VBITRATE").unwrap_or_else(|_| "6000".to_string());
-    let vbitrate_value: u64 = vbitrate.parse().unwrap_or(6000);
     let mut command = Command::new("ffmpeg");
-    command.arg("-nostdin").arg("-loglevel").arg("error");
-    if let Some(start) = start {
-        command.arg("-ss").arg(format!("{start:.3}"));
-    }
+    command.args(ffmpeg_args(&config.file, plan, start));
     command
-        .args(util::ffmpeg_input(&config.file))
-        .arg("-map")
-        .arg("0:v:0")
-        .arg("-map")
-        .arg("0:a:0?");
-    if plan.vcodec == "copy" {
-        command.args(["-c:v", "copy"]);
-    } else {
-        command.args([
-            "-vf",
-            "scale='min(1920,iw)':-2",
-            "-c:v",
-            &plan.vcodec,
-            "-preset",
-            "veryfast",
-            "-profile:v",
-            "high",
-            "-pix_fmt",
-            "yuv420p",
-            "-b:v",
-            &format!("{vbitrate}k"),
-            "-maxrate",
-            &format!("{vbitrate}k"),
-            "-bufsize",
-            &format!("{}k", vbitrate_value * 2),
-        ]);
-    }
-    if let Some(filter) = plan.audio_filter() {
-        // Boosting or downmixing means re-encoding, whatever the source codec was.
-        command.args(["-af", &filter, "-c:a", "aac", "-b:a", "192k", "-ac", "2"]);
-    } else if plan.acodec == "copy" {
-        command.args(["-c:a", "copy"]);
-    } else {
-        command.args(["-c:a", &plan.acodec, "-b:a", "192k", "-ac", "2"]);
-    }
-    match plan.container {
-        TranscodeContainer::FragmentedMp4 => {
-            command.args([
-                "-movflags",
-                "frag_keyframe+empty_moov+default_base_moof",
-                "-f",
-                "mp4",
-            ]);
-        }
-        TranscodeContainer::MpegTs => {
-            // ffmpeg converts H.264/HEVC to Annex B and AAC to ADTS on its own.
-            command.args(["-f", "mpegts"]);
-        }
-    }
-    command
-        .arg("pipe:1")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
@@ -763,6 +847,126 @@ fn spawn_ffmpeg(
 mod tests {
     use super::*;
     use crate::subtitles::SubtitleSource;
+
+    /// First packet time of each stream in an MPEG-TS file, with its flags:
+    /// `(video_pts, video_flags, audio_pts)`.
+    fn first_packets(file: &std::path::Path) -> (f64, String, f64) {
+        let output = std::process::Command::new("ffprobe")
+            .args([
+                "-v",
+                "error",
+                "-show_entries",
+                "packet=stream_index,pts_time,flags",
+            ])
+            .args(["-of", "csv=p=0"])
+            .arg(file)
+            .output()
+            .expect("ffprobe");
+        let text = String::from_utf8_lossy(&output.stdout);
+        let mut video = None;
+        let mut audio = None;
+        for line in text.lines() {
+            // ffprobe ends each CSV row with a separator.
+            let fields: Vec<&str> = line.split(',').collect();
+            let [index, pts, flags, ..] = fields.as_slice() else {
+                continue;
+            };
+            let Ok(pts) = pts.parse::<f64>() else {
+                continue;
+            };
+            match *index {
+                "0" if video.is_none() => video = Some((pts, (*flags).to_string())),
+                "1" if audio.is_none() => audio = Some(pts),
+                _ => {}
+            }
+        }
+        let (video, flags) = video.expect("a video packet");
+        (video, flags, audio.expect("an audio packet"))
+    }
+
+    /// A stream restarted at a keyframe (every seek) must open with sound and
+    /// picture together. With B-frame video, ffmpeg's input seek lands one
+    /// keyframe early; the copied video used to be kept from there while the
+    /// re-encoded audio started at `-ss`, so the stream opened with a whole
+    /// keyframe interval of video and no audio, which a TV may then play
+    /// silent.
+    #[test]
+    fn seeked_stream_starts_audio_and_video_together() {
+        if std::process::Command::new("ffmpeg")
+            .arg("-version")
+            .output()
+            .is_err()
+        {
+            eprintln!("ffmpeg not available; skipped");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("unicast-seek-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let source = dir.join("source.mkv");
+        // 12 s, a keyframe every 5 s, B-frames.
+        let made = std::process::Command::new("ffmpeg")
+            .args([
+                "-nostdin",
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=size=320x240:rate=25",
+            ])
+            .args([
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:sample_rate=48000",
+                "-t",
+                "12",
+            ])
+            .args([
+                "-c:v",
+                "libx264",
+                "-bf",
+                "3",
+                "-g",
+                "125",
+                "-keyint_min",
+                "125",
+            ])
+            .args(["-sc_threshold", "0", "-c:a", "aac", "-ac", "2", "-y"])
+            .arg(&source)
+            .status()
+            .is_ok_and(|status| status.success());
+        if !made {
+            eprintln!("ffmpeg cannot encode the H.264 test clip; skipped");
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        let plan = TranscodePlan {
+            vcodec: "copy".to_string(),
+            acodec: "aac".to_string(),
+            gain_db: 12,
+            channels: 2,
+            container: TranscodeContainer::MpegTs,
+        };
+        let seeked = dir.join("seeked.ts");
+        let ran = std::process::Command::new("ffmpeg")
+            .args(ffmpeg_args(&source, &plan, Some(5.0)))
+            .stdout(std::fs::File::create(&seeked).expect("out"))
+            .status()
+            .is_ok_and(|status| status.success());
+        assert!(ran, "ffmpeg stream");
+        let (video, flags, audio) = first_packets(&seeked);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            flags.starts_with('K'),
+            "stream opens on a keyframe, got {flags}"
+        );
+        assert!(
+            (audio - video).abs() < 0.5,
+            "audio starts {:.2} s after video",
+            audio - video
+        );
+    }
 
     async fn test_server(
         content: &[u8],
@@ -946,6 +1150,85 @@ mod tests {
 
         server.stop().await;
         assert!(!directory.join("vtt").exists());
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[tokio::test]
+    async fn serves_subtitles_as_srt_and_names_them_to_samsung() {
+        if !crate::daemon::have("ffmpeg") {
+            eprintln!("ffmpeg not installed; skipping subtitle conversion test");
+            return;
+        }
+        let srt =
+            "1\n00:00:05,000 --> 00:00:08,000\nGone\n\n2\n00:00:20,000 --> 00:00:25,000\nKept\n";
+        let (server, port, directory) = test_server(&sample(), loopback(), vec![(1, srt)]).await;
+        let base = format!("http://127.0.0.1:{port}");
+        let client = reqwest::Client::new();
+
+        let response = client
+            .get(format!("{base}/tok/sub/1.srt?start=10"))
+            .send()
+            .await
+            .expect("srt get");
+        assert_eq!(response.status(), 200);
+        assert!(
+            response.headers()["content-type"]
+                .to_str()
+                .expect("ascii")
+                .starts_with("text/srt")
+        );
+        let text = response.text().await.expect("srt body");
+        assert_eq!(text, "\u{feff}1\n00:00:10,000 --> 00:00:15,000\nKept\n\n");
+        let response = client
+            .head(format!("{base}/tok/sub/1.srt"))
+            .send()
+            .await
+            .expect("srt head");
+        assert_eq!(response.status(), 200);
+
+        // Samsung asks for the caption with getCaptionInfo.sec on the media
+        // request itself; the track comes from the stream URL's `sub=`.
+        let caption = |response: &reqwest::Response| {
+            response
+                .headers()
+                .get("captioninfo.sec")
+                .map(|value| value.to_str().expect("ascii").to_string())
+        };
+        let response = client
+            .head(format!("{base}/tok/sample.mp4?start=10&sub=1"))
+            .header("getCaptionInfo.sec", "1")
+            .send()
+            .await
+            .expect("media head");
+        assert_eq!(
+            caption(&response).as_deref(),
+            Some(format!("{base}/tok/sub/1.srt?start=10").as_str())
+        );
+        let response = client
+            .get(format!("{base}/tok/sample.mp4?sub=1"))
+            .header("getCaptionInfo.sec", "1")
+            .send()
+            .await
+            .expect("media get");
+        assert_eq!(
+            caption(&response).as_deref(),
+            Some(format!("{base}/tok/sub/1.srt").as_str())
+        );
+        let response = client
+            .head(format!("{base}/tok/sample.mp4?sub=1"))
+            .send()
+            .await
+            .expect("not asked");
+        assert_eq!(caption(&response), None);
+        let response = client
+            .head(format!("{base}/tok/sample.mp4?sub=9"))
+            .header("getCaptionInfo.sec", "1")
+            .send()
+            .await
+            .expect("unknown track");
+        assert_eq!(caption(&response), None);
+
+        server.stop().await;
         let _ = std::fs::remove_dir_all(&directory);
     }
 

@@ -466,6 +466,94 @@ fn parse_cue_timing(line: &str) -> Option<(f64, f64, &str)> {
 /// Rewrites a `WebVTT` document so its cues line up with a stream that started
 /// `seconds` into the file: cues that end before that point are dropped, one
 /// straddling it is clamped, the rest are shifted earlier.
+/// A `WebVTT` track as `SubRip`, the format Samsung (and most DLNA TVs) load
+/// as external subtitles. The header, NOTE/STYLE/REGION blocks and cue
+/// settings are dropped, cues are renumbered, `<i>`/`<b>`/`<u>` are kept and
+/// other markup removed, and a UTF-8 byte-order mark is added so the TV does
+/// not guess the encoding.
+pub fn vtt_to_srt(vtt: &str) -> String {
+    use std::fmt::Write as _;
+    let text = vtt.strip_prefix('\u{feff}').unwrap_or(vtt);
+    let mut out = String::from('\u{feff}');
+    let mut number = 0_usize;
+    let mut block: Vec<&str> = Vec::new();
+    let mut lines = text.lines().peekable();
+    while let Some(line) = lines.next() {
+        if !line.trim().is_empty() {
+            block.push(line);
+            if lines.peek().is_some() {
+                continue;
+            }
+        }
+        // A cue's timing line is its first, or its second after an id; the
+        // header and NOTE/STYLE/REGION blocks have none.
+        let cue = block
+            .iter()
+            .take(2)
+            .position(|line| line.contains("-->"))
+            .and_then(|at| parse_cue_timing(block[at]).map(|timing| (at, timing)));
+        if let Some((at, (start, end, _settings))) = cue {
+            let body: Vec<String> = block[at + 1..]
+                .iter()
+                .map(|line| srt_text(line))
+                .filter(|line| !line.trim().is_empty())
+                .collect();
+            if !body.is_empty() {
+                number += 1;
+                let _ = write!(
+                    out,
+                    "{number}\n{} --> {}\n",
+                    srt_timestamp(start),
+                    srt_timestamp(end)
+                );
+                for line in body {
+                    out.push_str(&line);
+                    out.push('\n');
+                }
+                out.push('\n');
+            }
+        }
+        block.clear();
+    }
+    out
+}
+
+fn srt_timestamp(seconds: f64) -> String {
+    format_timestamp(seconds).replacen('.', ",", 1)
+}
+
+/// One cue text line with only the markup `SubRip` renderers understand.
+fn srt_text(line: &str) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(line.len());
+    let mut rest = line;
+    while let Some(open) = rest.find('<') {
+        out.push_str(&rest[..open]);
+        let Some(close) = rest[open..].find('>') else {
+            out.push_str(&rest[open..]);
+            rest = "";
+            break;
+        };
+        let tag = &rest[open + 1..open + close];
+        let (slash, name) = tag.strip_prefix('/').map_or(("", tag), |name| ("/", name));
+        let name = name
+            .split(|c: char| c == '.' || c.is_whitespace())
+            .next()
+            .unwrap_or_default();
+        if matches!(name, "i" | "b" | "u") {
+            let _ = write!(out, "<{slash}{name}>");
+        }
+        rest = &rest[open + close + 1..];
+    }
+    out.push_str(rest);
+    out.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&nbsp;", " ")
+        .replace("&lrm;", "")
+        .replace("&rlm;", "")
+        .replace("&amp;", "&")
+}
+
 pub fn shift_vtt(text: &str, seconds: f64) -> String {
     if seconds <= 0.0 {
         return text.to_string();
@@ -557,6 +645,24 @@ mod tests {
         assert_eq!(parse_timestamp("nope"), None);
         assert_eq!(format_timestamp(3723.5), "01:02:03.500");
         assert_eq!(format_timestamp(0.0), "00:00:00.000");
+    }
+
+    #[test]
+    fn vtt_becomes_numbered_srt() {
+        let vtt = "WEBVTT\nKind: captions\n\nNOTE a comment\nspanning lines\n\nSTYLE\n::cue { color: red }\n\nintro\n00:01.500 --> 00:03.000 align:start line:90%\n<v Anna>Hello</v> <i>there</i>\n<c.loud>friend</c>\n\n01:02:03.004 --> 01:02:05.000\r\nTwo &amp; <b>three</b> <00:00:04.000>words\r\n";
+        assert_eq!(
+            vtt_to_srt(vtt),
+            "\u{feff}1\n00:00:01,500 --> 00:00:03,000\nHello <i>there</i>\nfriend\n\n2\n01:02:03,004 --> 01:02:05,000\nTwo & <b>three</b> words\n\n"
+        );
+        // A re-timed track keeps its numbering contiguous.
+        let shifted = vtt_to_srt(&shift_vtt(
+            "WEBVTT\n\n00:00:05.000 --> 00:00:08.000\nGone\n\n00:00:20.000 --> 00:00:25.000\nKept\n",
+            10.0,
+        ));
+        assert_eq!(
+            shifted,
+            "\u{feff}1\n00:00:10,000 --> 00:00:15,000\nKept\n\n"
+        );
     }
 
     #[test]

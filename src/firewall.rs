@@ -307,14 +307,14 @@ mod tests {
 
     #[test]
     fn ledger_lines_round_trip() {
-        let rule = Rule::parse("192.168.1.8 192.168.1.6 60020", 1).expect("rule");
-        assert_eq!(rule.line(), "192.168.1.8 192.168.1.6 60020");
-        assert!(rule.covers("192.168.1.8", "192.168.1.6", 60020));
-        assert!(!rule.covers("192.168.1.8", "192.168.1.6", 60021));
-        let legacy = Rule::parse("192.168.1.8", 60020).expect("legacy");
+        let rule = Rule::parse("192.168.50.20 192.168.50.10 60020", 1).expect("rule");
+        assert_eq!(rule.line(), "192.168.50.20 192.168.50.10 60020");
+        assert!(rule.covers("192.168.50.20", "192.168.50.10", 60020));
+        assert!(!rule.covers("192.168.50.20", "192.168.50.10", 60021));
+        let legacy = Rule::parse("192.168.50.20", 60020).expect("legacy");
         assert_eq!(legacy.bind, "any");
-        assert!(legacy.covers("192.168.1.8", "10.0.0.2", 60020));
-        assert_eq!(legacy.line(), "192.168.1.8");
+        assert!(legacy.covers("192.168.50.20", "10.0.0.2", 60020));
+        assert_eq!(legacy.line(), "192.168.50.20");
     }
 
     #[test]
@@ -324,10 +324,10 @@ mod tests {
             "10.0.0.0/8",
             "8.8.8.8",
             "0.0.0.0",
-            "192.168.1.8 any 60020",
-            "192.168.1.8 8.8.8.8 60020",
-            "192.168.1.8 192.168.1.6 0",
-            "192.168.1.8 192.168.1.6 22 extra",
+            "192.168.50.20 any 60020",
+            "192.168.50.20 8.8.8.8 60020",
+            "192.168.50.20 192.168.50.10 0",
+            "192.168.50.20 192.168.50.10 22 extra",
             "192.168.001.008",
         ] {
             assert_eq!(Rule::parse(line, 60020), None, "{line}");
@@ -358,16 +358,16 @@ mod tests {
 
     #[test]
     fn a_users_rule_for_the_same_traffic_is_left_alone() {
-        let rule = Rule::parse("192.168.1.8 192.168.1.6 60020", 1).expect("rule");
+        let rule = Rule::parse("192.168.50.20 192.168.50.10 60020", 1).expect("rule");
         for tuple in [
-            "### tuple ### deny tcp 60020 192.168.1.6 any 192.168.1.8 in",
-            "### tuple ### allow tcp 60020 192.168.1.6 any 192.168.1.8 in",
-            "### tuple ### allow_log tcp 60020 192.168.1.6/32 any 192.168.1.8/32 in comment=6d696e65",
-            "### tuple ### reject tcp 60020 192.168.1.6 any 192.168.1.8 in comment=a comment=b",
+            "### tuple ### deny tcp 60020 192.168.50.10 any 192.168.50.20 in",
+            "### tuple ### allow tcp 60020 192.168.50.10 any 192.168.50.20 in",
+            "### tuple ### allow_log tcp 60020 192.168.50.10/32 any 192.168.50.20/32 in comment=6d696e65",
+            "### tuple ### reject tcp 60020 192.168.50.10 any 192.168.50.20 in comment=a comment=b",
             // Pre-direction forms, which ufw loads as inbound.
-            "### tuple ### deny tcp 60020 192.168.1.6 any 192.168.1.8",
-            "### tuple ### limit tcp 60020 192.168.1.6 any 192.168.1.8 - -",
-            "### tuple ### deny tcp 60020 192.168.1.6 any 192.168.1.8 - - in",
+            "### tuple ### deny tcp 60020 192.168.50.10 any 192.168.50.20",
+            "### tuple ### limit tcp 60020 192.168.50.10 any 192.168.50.20 - -",
+            "### tuple ### deny tcp 60020 192.168.50.10 any 192.168.50.20 - - in",
         ] {
             assert_eq!(
                 scan(&format!("*filter\n{tuple}\n"), &rule),
@@ -378,17 +378,17 @@ mod tests {
             assert_eq!(scan(tuple, &rule), Some(true), "{tuple}");
         }
         for tuple in [
-            "### tuple ### deny tcp 60021 192.168.1.6 any 192.168.1.8 in",
-            "### tuple ### deny udp 60020 192.168.1.6 any 192.168.1.8 in",
-            "### tuple ### deny any 60020 192.168.1.6 any 192.168.1.8 in",
-            "### tuple ### deny tcp 60020 0.0.0.0/0 any 192.168.1.8 in",
-            "### tuple ### deny tcp 60020 192.168.1.6 any 192.168.1.9 in",
-            "### tuple ### deny tcp 60020 192.168.1.6 1234 192.168.1.8 in",
-            "### tuple ### deny tcp 60020 192.168.1.6 any 192.168.1.8 in_eth0",
-            "### tuple ### deny tcp 60020 192.168.1.6 any 192.168.1.8 out",
-            "### tuple ### route:deny tcp 60020 192.168.1.6 any 192.168.1.8 in",
-            "### tuple ### deny tcp 60020 192.168.1.6 any 192.168.1.8 Cast - in",
-            "# deny tcp 60020 192.168.1.6 any 192.168.1.8 in",
+            "### tuple ### deny tcp 60021 192.168.50.10 any 192.168.50.20 in",
+            "### tuple ### deny udp 60020 192.168.50.10 any 192.168.50.20 in",
+            "### tuple ### deny any 60020 192.168.50.10 any 192.168.50.20 in",
+            "### tuple ### deny tcp 60020 0.0.0.0/0 any 192.168.50.20 in",
+            "### tuple ### deny tcp 60020 192.168.50.10 any 192.168.50.21 in",
+            "### tuple ### deny tcp 60020 192.168.50.10 1234 192.168.50.20 in",
+            "### tuple ### deny tcp 60020 192.168.50.10 any 192.168.50.20 in_eth0",
+            "### tuple ### deny tcp 60020 192.168.50.10 any 192.168.50.20 out",
+            "### tuple ### route:deny tcp 60020 192.168.50.10 any 192.168.50.20 in",
+            "### tuple ### deny tcp 60020 192.168.50.10 any 192.168.50.20 Cast - in",
+            "# deny tcp 60020 192.168.50.10 any 192.168.50.20 in",
         ] {
             assert_eq!(scan(tuple, &rule), Some(false), "{tuple}");
         }
@@ -396,15 +396,16 @@ mod tests {
 
     #[test]
     fn user_rules_are_read_to_the_end_or_not_trusted() {
-        let rule = Rule::parse("192.168.1.8 192.168.1.6 60020", 1).expect("rule");
+        let rule = Rule::parse("192.168.50.20 192.168.50.10 60020", 1).expect("rule");
         // A matching rule after far more than any fixed cap is still found.
         let filler = "-A ufw-user-input -p tcp --dport 22 -j ACCEPT\n".repeat(200_000);
-        let text = format!("{filler}### tuple ### deny tcp 60020 192.168.1.6 any 192.168.1.8 in\n");
+        let text =
+            format!("{filler}### tuple ### deny tcp 60020 192.168.50.10 any 192.168.50.20 in\n");
         assert!(text.len() > 8 * 1024 * 1024);
         assert_eq!(scan(&text, &rule), Some(true));
         // A line too long to read is not skipped: the result is "unknown".
         let long = format!(
-            "{}\n### tuple ### deny tcp 60020 192.168.1.6 any 192.168.1.8 in\n",
+            "{}\n### tuple ### deny tcp 60020 192.168.50.10 any 192.168.50.20 in\n",
             "x".repeat(USER_RULES_MAX_LINE + 10)
         );
         assert_eq!(scan(&long, &rule), None);
@@ -413,10 +414,10 @@ mod tests {
 
     #[test]
     fn rule_is_scoped_to_the_bind_address() {
-        let rule = Rule::parse("192.168.1.8 192.168.1.6 60020", 1).expect("rule");
+        let rule = Rule::parse("192.168.50.20 192.168.50.10 60020", 1).expect("rule");
         assert_eq!(
             rule.ufw_args().join(" "),
-            "from 192.168.1.8 proto tcp to 192.168.1.6 port 60020 comment universal-cast-192.168.1.8"
+            "from 192.168.50.20 proto tcp to 192.168.50.10 port 60020 comment universal-cast-192.168.50.20"
         );
     }
 }

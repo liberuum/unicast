@@ -1294,10 +1294,10 @@ mod tests {
 
     #[test]
     fn hevc_gate() {
-        assert!(!hevc_capable("Chromecast", "Living Room"));
+        assert!(!hevc_capable("Chromecast", "Den"));
         assert!(!hevc_capable("Chromecast", ""));
         assert!(hevc_capable("Chromecast Ultra", ""));
-        assert!(hevc_capable("", "Living Room TV"));
+        assert!(hevc_capable("", "Den TV"));
         assert!(hevc_capable("LG webOS", ""));
         assert!(hevc_capable("", "Android TV"));
     }
@@ -1314,14 +1314,14 @@ mod tests {
             source: std::path::PathBuf::from("/tmp/movie.mp4"),
             tracks: vec![TextTrack {
                 id: 1,
-                url: "http://192.168.1.6:60020/tok/sub/1.vtt".to_string(),
+                url: "http://192.168.50.10:60020/tok/sub/1.vtt".to_string(),
                 name: "English".to_string(),
                 language: "en".to_string(),
             }],
             active_track: Some(1),
         };
         let payload = media_payload(
-            "http://192.168.1.6:60020/tok/movie.mp4",
+            "http://192.168.50.10:60020/tok/movie.mp4",
             "Movie",
             &options,
             12.5,
@@ -1329,7 +1329,7 @@ mod tests {
         assert_eq!(payload["metadata"]["images"], json!([]));
         assert_eq!(
             payload["tracks"][0]["trackContentId"],
-            json!("http://192.168.1.6:60020/tok/sub/1.vtt?start=12.500")
+            json!("http://192.168.50.10:60020/tok/sub/1.vtt?start=12.500")
         );
         let echo = json!({
             "type": "MEDIA_STATUS",
@@ -1361,7 +1361,7 @@ mod tests {
                 assert_eq!(entry.media_session_id, 3);
                 assert_eq!(
                     entry.media.as_ref().map(|m| m.content_id.as_str()),
-                    Some("http://192.168.1.6:60020/tok/movie.mp4")
+                    Some("http://192.168.50.10:60020/tok/movie.mp4")
                 );
             }
             other => panic!("unexpected parse result: {other:?}"),

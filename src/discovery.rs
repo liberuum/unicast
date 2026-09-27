@@ -314,9 +314,9 @@ mod tests {
 
     #[test]
     fn mdns_uses_only_the_lan_interface() {
-        let lan: Ipv4Addr = "192.168.1.6".parse().expect("ip");
+        let lan: Ipv4Addr = "192.168.50.10".parse().expect("ip");
         let ip = |s: &str| s.parse::<std::net::IpAddr>().expect("ip");
-        assert!(mdns_interface_allowed(ip("192.168.1.6"), Some(lan)));
+        assert!(mdns_interface_allowed(ip("192.168.50.10"), Some(lan)));
         assert!(!mdns_interface_allowed(ip("172.17.0.1"), Some(lan)));
         assert!(!mdns_interface_allowed(ip("100.101.1.2"), Some(lan)));
         assert!(!mdns_interface_allowed(ip("fe80::1"), Some(lan)));
@@ -324,13 +324,13 @@ mod tests {
         assert!(!mdns_interface_allowed(ip("100.101.1.2"), None));
         assert!(!mdns_interface_allowed(ip("127.0.0.1"), None));
         let tunnel: Ipv4Addr = "100.101.1.2".parse().expect("ip");
-        assert!(mdns_interface_allowed(ip("192.168.1.6"), Some(tunnel)));
+        assert!(mdns_interface_allowed(ip("192.168.50.10"), Some(tunnel)));
         assert!(!mdns_interface_allowed(ip("100.101.1.2"), Some(tunnel)));
     }
 
     #[test]
     fn only_lan_addresses_are_receivers() {
-        for ip in ["192.168.1.8", "10.0.0.7", "172.16.4.2", "169.254.3.3"] {
+        for ip in ["192.168.50.20", "10.0.0.7", "172.16.4.2", "169.254.3.3"] {
             assert!(lan_address(ip.parse().expect("ip")), "{ip}");
         }
         for ip in [
@@ -373,12 +373,12 @@ mod tests {
     #[test]
     fn service_name_strips_suffix() {
         assert_eq!(
-            service_name("Living Room TV._googlecast._tcp.local.", CAST_SUFFIX),
-            "Living Room TV"
+            service_name("Den TV._googlecast._tcp.local.", CAST_SUFFIX),
+            "Den TV"
         );
         assert_eq!(
-            service_name("Samsung 7 Series._airplay._tcp.local.", AIRPLAY_SUFFIX),
-            "Samsung 7 Series"
+            service_name("Kitchen TV._airplay._tcp.local.", AIRPLAY_SUFFIX),
+            "Kitchen TV"
         );
     }
 }

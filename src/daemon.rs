@@ -127,8 +127,14 @@ impl ServeContext {
         if self.exact_seek {
             position
         } else {
-            cast::keyframe_at_or_before(&self.pinned.data_path(), position).unwrap_or(position)
+            cast::keyframe_at_or_before(&self.pinned.data_path(), position)
+                .map_or(position, keyframe_start)
         }
+    }
+
+    /// SRT URL of subtitle track `id` for a stream starting at `start`.
+    fn caption(&self, id: u32, start: f64) -> String {
+        caption_url(self.bind, self.port, &self.token, id, start)
     }
 
     /// The subtitle tracks as the Cast receiver should see them.
@@ -222,11 +228,43 @@ fn serve_plan(device: &Device, path: &str, token: &str, boost: i32) -> ServePlan
     }
 }
 
-fn start_url(base: &str, start: f64) -> String {
+/// A keyframe time as the `-ss` the stream starts at: rounded down to the
+/// millisecond it is sent with, never up, so the keyframe itself is not
+/// before the start and dropped (the stream would then open on the next one).
+fn keyframe_start(keyframe: f64) -> f64 {
+    (keyframe * 1000.0).floor() / 1000.0
+}
+
+/// Receivers the daemon can show subtitles on: Cast by text tracks, DLNA TVs
+/// by naming an SRT file with the video.
+fn subtitles_supported(protocol: &str) -> bool {
+    matches!(protocol, "cast" | "dlna")
+}
+
+/// The stream URL a receiver loads: `start` restarts it that far in, and
+/// `sub` names the subtitle track a Samsung TV should ask for alongside it.
+fn stream_url(base: &str, start: f64, sub: Option<u32>) -> String {
+    let mut query = Vec::new();
+    if start > 0.0 {
+        query.push(format!("start={start:.3}"));
+    }
+    if let Some(id) = sub {
+        query.push(format!("sub={id}"));
+    }
+    if query.is_empty() {
+        base.to_string()
+    } else {
+        format!("{base}?{}", query.join("&"))
+    }
+}
+
+/// The SRT URL of subtitle track `id`, re-timed for a stream starting at `start`.
+fn caption_url(bind: Ipv4Addr, port: u16, token: &str, id: u32, start: f64) -> String {
+    let base = format!("http://{bind}:{port}/{token}/sub/{id}.srt");
     if start > 0.0 {
         format!("{base}?start={start:.3}")
     } else {
-        base.to_string()
+        base
     }
 }
 
@@ -509,7 +547,7 @@ impl Daemon {
             // Cast receivers report volume once connected; DLNA needs a
             // RenderingControl service; AirPlay URL playback has no volume API.
             session.volume_supported = protocol == "dlna" && device.rendering_url.is_some();
-            session.subtitles_supported = protocol == "cast";
+            session.subtitles_supported = subtitles_supported(&protocol);
         }
 
         let token = util::random_token();
@@ -518,8 +556,7 @@ impl Daemon {
         let duration = cast::media_duration(&pinned.data_path());
         let boost = settings::audio_boost();
         let subtitle_tracks = subtitles::discover(Path::new(&path));
-        let subtitles_supported = protocol == "cast";
-        let subtitle = if subtitles_supported {
+        let subtitle = if subtitles_supported(&protocol) {
             preferred_subtitle(&subtitle_tracks)
         } else {
             None
@@ -570,7 +607,10 @@ impl Daemon {
                 self.connect_cast(context, boost, subtitle, session_id)
                     .await
             }
-            "dlna" => self.connect_dlna(context, boost, session_id).await,
+            "dlna" => {
+                self.connect_dlna(context, boost, subtitle, session_id)
+                    .await
+            }
             "airplay" => self.connect_airplay(context, boost, session_id).await,
             other => Err(format!("Unsupported protocol: {other}")),
         };
@@ -678,6 +718,7 @@ impl Daemon {
         &self,
         context: ServeContext,
         boost: i32,
+        subtitle: Option<u32>,
         session_id: u64,
     ) -> Result<(), String> {
         let control = context
@@ -689,9 +730,16 @@ impl Daemon {
         let plan = serve_plan(&context.device, &context.path, &context.token, boost);
         let url = self.start_media(&context, &plan).await?;
         let mime = plan.mime_for_dlna(&context.path);
-        dlna::play(&control, &url, &context.title, &mime)
-            .await
-            .map_err(|error| format!("Receiver rejected the stream: {error}"))?;
+        let caption = subtitle.map(|id| context.caption(id, 0.0));
+        dlna::play(
+            &control,
+            &stream_url(&url, 0.0, subtitle),
+            &context.title,
+            &mime,
+            caption.as_deref(),
+        )
+        .await
+        .map_err(|error| format!("Receiver rejected the stream: {error}"))?;
         let offset = Arc::new(PositionOffset::default());
         let poller = tokio::spawn(dlna_poll(
             Arc::clone(&self.state),
@@ -1061,17 +1109,25 @@ impl Daemon {
                 _ => return error_response("Unknown subtitle track"),
             },
         };
-        if session.protocol != "cast" {
-            return error_response(
-                "Subtitle selection is available on Google Cast receivers only for now",
-            );
-        }
-        {
-            let active = self.active.lock().await;
-            let Some(cast) = active.cast.as_ref() else {
-                return error_response("No cast session");
-            };
-            cast.set_subtitle(track);
+        match session.protocol.as_str() {
+            "cast" => {
+                let active = self.active.lock().await;
+                let Some(cast) = active.cast.as_ref() else {
+                    return error_response("No cast session");
+                };
+                cast.set_subtitle(track);
+            }
+            "dlna" => {
+                // A DLNA TV takes subtitles only with a video it loads: reload
+                // the stream where it is, naming the new track (or none).
+                if let Ok(mut state) = self.state.write() {
+                    state.subtitle = track;
+                }
+                if let Err(error) = self.restart_dlna(session.position).await {
+                    return error_response(&format!("Could not switch subtitles: {error}"));
+                }
+            }
+            _ => return error_response("Subtitles are not available over AirPlay"),
         }
         let preference = track
             .and_then(|id| {
@@ -1191,13 +1247,18 @@ impl Daemon {
         } else {
             0.0
         };
-        let url = start_url(&context.url, start);
+        // The TV reads subtitles only when a video loads, so every reload
+        // names the current track again, re-timed to where the stream starts.
+        let subtitle = self.session().subtitle;
+        let url = stream_url(&context.url, start, subtitle);
+        let caption = subtitle.map(|id| context.caption(id, start));
         dlna::stop(&dlna_session.control_url).await;
         let result = dlna::play(
             &dlna_session.control_url,
             &url,
             &context.title,
             &context.mime_for_dlna(),
+            caption.as_deref(),
         )
         .await;
         if result.is_ok() && !context.transcode && position > 0.0 {
@@ -1257,7 +1318,7 @@ impl Daemon {
         } else {
             0.0
         };
-        let url = start_url(&context.url, start);
+        let url = stream_url(&context.url, start, None);
         // Legacy AirPlay takes the start as a fraction of the duration; only
         // meaningful for a directly served (seekable) file.
         let fraction = match context.duration {
@@ -1641,4 +1702,42 @@ pub fn main() {
             tracing::error!("daemon stopped: {error}");
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stream_and_caption_urls_carry_start_and_track() {
+        let base = "http://192.168.50.10:60020/tok/stream.ts";
+        assert_eq!(stream_url(base, 0.0, None), base);
+        assert_eq!(stream_url(base, 12.5, None), format!("{base}?start=12.500"));
+        assert_eq!(stream_url(base, 0.0, Some(3)), format!("{base}?sub=3"));
+        assert_eq!(
+            stream_url(base, 12.5, Some(3)),
+            format!("{base}?start=12.500&sub=3")
+        );
+        let bind: Ipv4Addr = "192.168.50.10".parse().expect("ip");
+        assert_eq!(
+            caption_url(bind, 60020, "tok", 3, 0.0),
+            "http://192.168.50.10:60020/tok/sub/3.srt"
+        );
+        assert_eq!(
+            caption_url(bind, 60020, "tok", 3, 12.5),
+            "http://192.168.50.10:60020/tok/sub/3.srt?start=12.500"
+        );
+    }
+
+    #[test]
+    fn keyframe_start_never_rounds_past_the_keyframe() {
+        // A 1/24000 time base keyframe: rounding would give 1371.371, after it.
+        assert_eq!(format!("{:.3}", keyframe_start(1_371.370_667)), "1371.370");
+        for keyframe in [1371.37, 670.67, 0.0, 5.0, 2452.45] {
+            let start = keyframe_start(keyframe);
+            let sent: f64 = format!("{start:.3}").parse().expect("number");
+            assert!(sent <= keyframe, "{keyframe} -> {sent}");
+            assert!(keyframe - sent < 0.002, "{keyframe} -> {sent}");
+        }
+    }
 }
