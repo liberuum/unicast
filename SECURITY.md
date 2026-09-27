@@ -18,8 +18,17 @@ within a week.
   passed to a shell.
 - The media server only listens on the LAN address, serves a single file per
   cast under an unguessable token, and only to the receiver's IP.
-- The only privileged action is an optional `pkexec ufw allow` for the
-  receiver's IP, which polkit confirms with you.
+- Receivers must have a private or link-local IPv4 address; anything else is
+  refused, whether typed in, discovered, or found in the settings files.
+- Privileged actions, each confirmed with you: setup installs missing packages
+  with `omarchy pkg add`, and casting may run `pkexec ufw allow from
+  <receiver-ip> proto tcp to <your-lan-ip> port <port>`. Only rules the daemon
+  added are ever deleted.
+- The daemon and scripts act only on what UniCast created: no process is
+  signalled unless it is the installed `omarchy-castd` binary, and a busy
+  media port is reported, not reclaimed.
+- Files named by other programs (MPRIS players) are cast only if they are
+  audio or video.
 
 Marketplace listing, automated scans and this document are not a security
 audit.

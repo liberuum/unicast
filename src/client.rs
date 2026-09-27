@@ -82,8 +82,25 @@ fn build(args: &[String]) -> Value {
     request
 }
 
+/// The only binaries the client will start or register as the login service:
+/// the one the setup script installs and the one a distro package would.
+fn trusted_daemon() -> Option<std::path::PathBuf> {
+    let executable = std::env::current_exe().ok()?;
+    let allowed = [
+        util::home().join(".local/bin/omarchy-castd"),
+        std::path::PathBuf::from("/usr/bin/omarchy-castd"),
+    ];
+    let text = executable.to_str()?;
+    // The path goes into a unit file: refuse anything systemd would parse
+    // as quoting, a specifier or a new line rather than escape it.
+    if text.contains(['"', '\\', '%', '\n', '\r']) {
+        return None;
+    }
+    allowed.contains(&executable).then_some(executable)
+}
+
 fn systemctl(args: &[&str]) -> bool {
-    Command::new("systemctl")
+    Command::new("/usr/bin/systemctl")
         .arg("--user")
         .args(args)
         .stdin(Stdio::null())
@@ -93,10 +110,7 @@ fn systemctl(args: &[&str]) -> bool {
         .is_ok_and(|status| status.success())
 }
 
-fn install_unit() -> bool {
-    let Ok(executable) = std::env::current_exe() else {
-        return false;
-    };
+fn install_unit(executable: &Path) -> bool {
     let unit = format!(
         "[Unit]\nDescription=omarchy-cast media daemon\n\n[Service]\nType=simple\nExecStart=\"{}\"\nRestart=on-failure\nRestartSec=1\n\n[Install]\nWantedBy=default.target\n",
         executable.display()
@@ -121,7 +135,10 @@ fn ensure() -> bool {
     if ping_sync(Duration::from_millis(2000)) {
         return true;
     }
-    if install_unit() && systemctl(&["enable", "--now", UNIT_NAME]) {
+    let Some(executable) = trusted_daemon() else {
+        return false;
+    };
+    if install_unit(&executable) && systemctl(&["enable", "--now", UNIT_NAME]) {
         for _ in 0..60 {
             if ping_sync(Duration::from_millis(500)) {
                 return true;
@@ -129,13 +146,7 @@ fn ensure() -> bool {
             std::thread::sleep(Duration::from_millis(100));
         }
     }
-    let Ok(executable) = std::env::current_exe() else {
-        return false;
-    };
-    if util::detached_command(Path::new(&executable))
-        .spawn()
-        .is_err()
-    {
+    if util::detached_command(&executable).spawn().is_err() {
         return false;
     }
     for _ in 0..50 {
@@ -152,7 +163,7 @@ pub fn main(args: &[String]) {
     if !ensure() {
         println!(
             "{}",
-            json!({"ok": false, "error": "cast service unavailable"})
+            json!({"ok": false, "error": "cast service unavailable (the backend must be installed at ~/.local/bin/omarchy-castd or /usr/bin/omarchy-castd)"})
         );
         return;
     }

@@ -50,6 +50,15 @@ grep -q 'persist-credentials: false' .github/workflows/ci.yml \
 grep -Eq '^permissions:' .github/workflows/ci.yml \
   || { echo "CI must declare minimal workflow permissions" >&2; exit 1; }
 
+step "locked builds"
+# Every cargo invocation that resolves dependencies must use Cargo.lock as is.
+if grep -EHn '(^|[[:space:]"(])cargo"?\)?[[:space:]]+(build|test|clippy|run|install)\b' \
+    bin/omarchy-cast-setup tests/run .github/workflows/ci.yml \
+    | grep -v -- '--locked' | grep -v -- '--frozen' | grep -v '^tests/run:.*grep'; then
+  echo "cargo build/test/clippy/run/install must pass --locked or --frozen" >&2
+  exit 1
+fi
+
 step "qml parse"
 if command -v qmlformat >/dev/null; then
   for file in *.qml; do qmlformat -n "$file" >/dev/null; done
@@ -63,8 +72,8 @@ test -x bin/omarchy-cast && test -x bin/omarchy-cast-setup && test -x bin/omarch
 
 step "rust"
 cargo fmt --check
-cargo clippy --all-targets -- -D warnings
-cargo test
+cargo clippy --all-targets --locked -- -D warnings
+cargo test --locked
 
 echo
 echo "tests/run: OK"

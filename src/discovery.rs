@@ -6,6 +6,7 @@ use mdns_sd::{ResolvedService, ServiceDaemon, ServiceEvent};
 
 use crate::dlna;
 use crate::protocol::Device;
+use crate::util;
 
 const CAST_SERVICE: &str = "_googlecast._tcp.local.";
 const CAST_SUFFIX: &str = "._googlecast._tcp.local.";
@@ -21,7 +22,7 @@ const MAX_MDNS_DEVICES: usize = 32;
 /// addresses are receivers on this LAN; anything else (loopback, public
 /// hosts) is ignored rather than probed.
 fn lan_address(ip: Ipv4Addr) -> bool {
-    (ip.is_private() || ip.is_link_local()) && !ip.is_broadcast()
+    util::lan_ipv4(ip)
 }
 
 pub async fn discover(
@@ -33,11 +34,24 @@ pub async fn discover(
         .await
         .unwrap_or_default();
     let mut candidates: Vec<String> = mdns.iter().map(|device| device.ip.clone()).collect();
-    candidates.extend(manual_ips.iter().cloned());
+    candidates.extend(
+        manual_ips
+            .iter()
+            .filter_map(|ip| util::valid_receiver_ip(ip)),
+    );
     candidates.sort();
     candidates.dedup();
+    // A spoofed mDNS record naming this machine must not make it probe itself.
+    if let Some(own) = lan_ip.map(|ip| ip.to_string()) {
+        candidates.retain(|ip| *ip != own);
+    }
     let dlna_devices = dlna::discover(lan_ip, &candidates, use_multicast).await;
+    // Whatever a receiver or a hand-edited settings file claims, only LAN
+    // IPv4 receivers are ever listed, served to, or let through the firewall.
     merge(mdns, dlna_devices)
+        .into_iter()
+        .filter(|device| util::valid_receiver_ip(&device.ip).as_deref() == Some(device.ip.as_str()))
+        .collect()
 }
 
 fn mdns_devices() -> Vec<Device> {

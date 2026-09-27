@@ -2,7 +2,20 @@ use std::collections::HashMap;
 
 use zbus::zvariant::OwnedValue;
 
+/// Longest the whole player lookup may take: any session-bus peer can own an
+/// MPRIS name, and one that never answers must not stall a cast.
+const LOOKUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
 pub async fn current_file() -> Option<String> {
+    let path = tokio::time::timeout(LOOKUP_TIMEOUT, lookup())
+        .await
+        .ok()??;
+    // What a player reports is untrusted: only a file with an audio/video
+    // extension goes on (connect then also requires ffprobe to find media).
+    crate::util::is_media_extension(&path).then_some(path)
+}
+
+async fn lookup() -> Option<String> {
     let connection = zbus::Connection::session().await.ok()?;
     let dbus = zbus::fdo::DBusProxy::new(&connection).await.ok()?;
     let names = dbus.list_names().await.ok()?;

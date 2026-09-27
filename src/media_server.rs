@@ -178,7 +178,19 @@ pub async fn start(
             }
         }
     }
+    // A busy port is reported, never reclaimed: the daemon's own previous
+    // server is stopped in-process before this runs, so whatever still holds
+    // the port is not ours to touch.
     if let Some(error) = bind_error {
+        if error.kind() == std::io::ErrorKind::AddrInUse {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AddrInUse,
+                format!(
+                    "port {port} is used by another program; stop it or set \
+                     OMARCHY_CAST_PORT to a free port"
+                ),
+            ));
+        }
         return Err(error);
     }
     socket.listen(128)?;
@@ -188,6 +200,7 @@ pub async fn start(
 
     let shutdown = CancellationToken::new();
     let subtitle_dir = options.subtitle_dir.clone();
+    let allow_at_accept = options.allow.clone();
     let config = Arc::new(ServerConfig {
         file: options.file,
         token: options.token,
@@ -206,7 +219,12 @@ pub async fn start(
         .with_state(config);
     let make = app.into_make_service_with_connect_info::<SocketAddr>();
 
-    let listener = listener.tap_io(|stream| {
+    let listener = AllowlistListener {
+        inner: listener,
+        allow: allow_at_accept,
+        refused: 0,
+    }
+    .tap_io(|stream| {
         let _ = stream.set_nodelay(true);
     });
     let task = tokio::spawn(async move {
@@ -222,6 +240,44 @@ pub async fn start(
         },
         bound_port,
     ))
+}
+
+/// Closes connections from anyone but the receiver as soon as they are
+/// accepted, before hyper reads a byte: with `ufw` off, other LAN hosts could
+/// otherwise hold idle connections open and use up the daemon's descriptors.
+struct AllowlistListener {
+    inner: tokio::net::TcpListener,
+    allow: Vec<IpAddr>,
+    refused: u64,
+}
+
+impl axum::serve::Listener for AllowlistListener {
+    type Io = tokio::net::TcpStream;
+    type Addr = SocketAddr;
+
+    async fn accept(&mut self) -> (Self::Io, Self::Addr) {
+        loop {
+            let (stream, peer) = axum::serve::Listener::accept(&mut self.inner).await;
+            // Fail closed: an empty allowlist admits nobody.
+            if self.allow.contains(&peer.ip()) {
+                return (stream, peer);
+            }
+            drop(stream);
+            // Rate-limited so a flood cannot flood the journal too.
+            self.refused = self.refused.saturating_add(1);
+            if self.refused.is_power_of_two() {
+                tracing::warn!(
+                    "refused connection from {} (not the receiver; {} so far)",
+                    peer.ip(),
+                    self.refused
+                );
+            }
+        }
+    }
+
+    fn local_addr(&self) -> std::io::Result<Self::Addr> {
+        self.inner.local_addr()
+    }
 }
 
 async fn handle(
@@ -424,6 +480,12 @@ async fn subtitle_response(config: &ServerConfig, name: &str, start: Option<f64>
             return (StatusCode::NOT_FOUND, "").into_response();
         }
     };
+    if tokio::fs::metadata(&path)
+        .await
+        .map_or(true, |meta| meta.len() > subtitles::MAX_VTT_BYTES)
+    {
+        return (StatusCode::NOT_FOUND, "").into_response();
+    }
     let Ok(text) = tokio::fs::read_to_string(&path).await else {
         return (StatusCode::INTERNAL_SERVER_ERROR, "").into_response();
     };
@@ -625,8 +687,7 @@ fn spawn_ffmpeg(
         command.arg("-ss").arg(format!("{start:.3}"));
     }
     command
-        .arg("-i")
-        .arg(&config.file)
+        .args(util::ffmpeg_input(&config.file))
         .arg("-map")
         .arg("0:v:0")
         .arg("-map")
@@ -681,17 +742,13 @@ fn spawn_ffmpeg(
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
         .kill_on_drop(true);
+    // Debug-formatted: the file name is part of argv and must not be able
+    // to forge journal lines.
     tracing::info!(
-        "ffmpeg: {}",
-        std::iter::once(command.as_std().get_program().to_string_lossy().to_string())
-            .chain(
-                command
-                    .as_std()
-                    .get_args()
-                    .map(|a| a.to_string_lossy().to_string())
-            )
+        "ffmpeg: {:?}",
+        std::iter::once(command.as_std().get_program())
+            .chain(command.as_std().get_args())
             .collect::<Vec<_>>()
-            .join(" ")
     );
     command.spawn()
 }
@@ -894,9 +951,9 @@ mod tests {
         let response = reqwest::Client::new()
             .get(format!("http://127.0.0.1:{port}/tok/sample.mp4"))
             .send()
-            .await
-            .expect("request");
-        assert_eq!(response.status(), 403);
+            .await;
+        // Refused at accept: the connection is closed before any response.
+        assert!(response.is_err(), "non-receiver peer got {response:?}");
         server.stop().await;
         let _ = std::fs::remove_dir_all(&directory);
     }
@@ -907,9 +964,9 @@ mod tests {
         let response = reqwest::Client::new()
             .get(format!("http://127.0.0.1:{port}/tok/sample.mp4"))
             .send()
-            .await
-            .expect("request");
-        assert_eq!(response.status(), 403);
+            .await;
+        // Refused at accept: the connection is closed before any response.
+        assert!(response.is_err(), "non-receiver peer got {response:?}");
         server.stop().await;
         let _ = std::fs::remove_dir_all(&directory);
     }

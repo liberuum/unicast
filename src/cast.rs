@@ -96,21 +96,20 @@ struct ProbeStream {
 }
 
 fn probe(path: &Path) -> Vec<ProbeStream> {
-    let output = std::process::Command::new("ffprobe")
-        .args([
+    let Some(stdout) = util::ffprobe(
+        &[
             "-v",
             "error",
             "-show_entries",
             "stream=codec_type,codec_name,profile,level,channels",
             "-of",
             "json",
-        ])
-        .arg(path)
-        .output();
-    let Ok(output) = output else {
+        ],
+        path,
+    ) else {
         return Vec::new();
     };
-    let Ok(value) = serde_json::from_slice::<serde_json::Value>(&output.stdout) else {
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(&stdout) else {
         return Vec::new();
     };
     value
@@ -146,20 +145,27 @@ fn probe(path: &Path) -> Vec<ProbeStream> {
         .unwrap_or_default()
 }
 
+/// True when ffprobe finds an audio or video stream: the file is media, not
+/// merely a readable file some other program pointed the daemon at.
+pub fn has_media_stream(path: &Path) -> bool {
+    probe(path)
+        .iter()
+        .any(|stream| matches!(stream.codec_type.as_str(), "video" | "audio"))
+}
+
 pub fn media_duration(path: &Path) -> Option<f64> {
-    let output = std::process::Command::new("ffprobe")
-        .args([
+    let stdout = util::ffprobe(
+        &[
             "-v",
             "error",
             "-show_entries",
             "format=duration",
             "-of",
             "default=noprint_wrappers=1:nokey=1",
-        ])
-        .arg(path)
-        .output()
-        .ok()?;
-    String::from_utf8_lossy(&output.stdout).trim().parse().ok()
+        ],
+        path,
+    )?;
+    String::from_utf8_lossy(&stdout).trim().parse().ok()
 }
 
 pub fn keyframe_at_or_before(path: &Path, time: f64) -> Option<f64> {
@@ -168,8 +174,8 @@ pub fn keyframe_at_or_before(path: &Path, time: f64) -> Option<f64> {
     }
     let start = (time - 30.0).max(0.0);
     let interval = format!("{start:.3}%{time:.3}");
-    let output = std::process::Command::new("ffprobe")
-        .args([
+    let stdout = util::ffprobe(
+        &[
             "-v",
             "error",
             "-select_streams",
@@ -180,11 +186,10 @@ pub fn keyframe_at_or_before(path: &Path, time: f64) -> Option<f64> {
             "csv=p=0",
             "-read_intervals",
             &interval,
-        ])
-        .arg(path)
-        .output()
-        .ok()?;
-    let text = String::from_utf8_lossy(&output.stdout);
+        ],
+        path,
+    )?;
+    let text = String::from_utf8_lossy(&stdout);
     let mut best: Option<f64> = None;
     for line in text.lines() {
         let mut fields = line.split(',');
@@ -1265,7 +1270,7 @@ fn publish_volume(
 }
 
 fn set_error(state: &Arc<RwLock<Session>>, session_id: u64, message: &str) {
-    tracing::warn!("cast session {session_id} failed: {message}");
+    tracing::warn!("cast session {session_id} failed: {message:?}");
     update(state, session_id, |session| {
         session.state = SessionState::Error;
         session.error = message.to_string();

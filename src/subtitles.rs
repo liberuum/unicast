@@ -96,8 +96,17 @@ fn language_lookup(token: &str) -> Option<(&'static str, &'static str)> {
         .map(|(_, code, name)| (*code, *name))
 }
 
+/// Largest sidecar subtitle file considered; real ones are well under 1 MiB.
+const MAX_SIDECAR_BYTES: u64 = 8 * 1024 * 1024;
+/// Largest converted `WebVTT` file the daemon writes or serves.
+pub const MAX_VTT_BYTES: u64 = 16 * 1024 * 1024;
+/// Most subtitle tracks offered for one file (sidecars plus embedded).
+const MAX_TRACKS: usize = 32;
+
+/// A regular file (not a symlink) of sane size with a subtitle extension.
 fn is_subtitle_file(path: &Path) -> bool {
-    path.is_file()
+    std::fs::symlink_metadata(path)
+        .is_ok_and(|meta| meta.file_type().is_file() && meta.len() <= MAX_SIDECAR_BYTES)
         && path
             .extension()
             .and_then(|ext| ext.to_str())
@@ -213,8 +222,8 @@ struct EmbeddedStream {
 }
 
 fn embedded(media: &Path) -> Vec<EmbeddedStream> {
-    let output = std::process::Command::new("ffprobe")
-        .args([
+    let Some(stdout) = crate::util::ffprobe(
+        &[
             "-v",
             "error",
             "-select_streams",
@@ -223,13 +232,12 @@ fn embedded(media: &Path) -> Vec<EmbeddedStream> {
             "stream=index,codec_name:stream_tags=language,title",
             "-of",
             "json",
-        ])
-        .arg(media)
-        .output();
-    let Ok(output) = output else {
+        ],
+        media,
+    ) else {
         return Vec::new();
     };
-    let Ok(value) = serde_json::from_slice::<serde_json::Value>(&output.stdout) else {
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(&stdout) else {
         return Vec::new();
     };
     let text = |v: &serde_json::Value, key: &str| {
@@ -294,6 +302,7 @@ pub fn discover(media: &Path) -> Vec<SubtitleTrack> {
             },
         });
     }
+    tracks.truncate(MAX_TRACKS);
     for (n, track) in tracks.iter_mut().enumerate() {
         track.id = u32::try_from(n + 1).unwrap_or(u32::MAX);
     }
@@ -307,9 +316,20 @@ const CONVERT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120)
 /// Whether `path` is valid UTF-8 (a BOM is fine). Unreadable files count as
 /// UTF-8 so ffmpeg gets to report the real error.
 async fn is_utf8_file(path: &Path) -> bool {
-    tokio::fs::read(path)
+    use tokio::io::AsyncReadExt;
+    let Ok(file) = tokio::fs::File::open(path).await else {
+        return true;
+    };
+    let mut bytes = Vec::new();
+    if file
+        .take(MAX_SIDECAR_BYTES)
+        .read_to_end(&mut bytes)
         .await
-        .map_or(true, |bytes| std::str::from_utf8(&bytes).is_ok())
+        .is_err()
+    {
+        return true;
+    }
+    std::str::from_utf8(&bytes).is_ok()
 }
 
 /// Path of the `WebVTT` file for `track`, converting it into `dir` on first use.
@@ -380,12 +400,15 @@ fn ffmpeg_args(source: &Path, stream_index: Option<u32>, charenc: Option<&str>) 
         args.push("-sub_charenc".to_string());
         args.push(charenc.to_string());
     }
-    args.push("-i".to_string());
-    args.push(source.to_string_lossy().to_string());
+    args.extend(crate::util::ffmpeg_input(source));
     if let Some(index) = stream_index {
         args.push("-map".to_string());
         args.push(format!("0:{index}"));
     }
+    // Stop writing at the cap: a crafted track must not fill the RAM-backed
+    // runtime directory the cache lives in.
+    args.push("-fs".to_string());
+    args.push(MAX_VTT_BYTES.to_string());
     args.push("-f".to_string());
     args.push("webvtt".to_string());
     args

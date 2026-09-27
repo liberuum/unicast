@@ -112,6 +112,18 @@ pub fn valid_ip(value: &str) -> Option<String> {
     value.trim().parse::<IpAddr>().ok().map(|ip| ip.to_string())
 }
 
+/// Private (RFC 1918) or link-local IPv4, never broadcast: the only addresses
+/// the daemon talks to, serves media to, or opens the firewall for.
+pub fn lan_ipv4(ip: Ipv4Addr) -> bool {
+    (ip.is_private() || ip.is_link_local()) && !ip.is_broadcast()
+}
+
+/// A receiver address the daemon will accept: a LAN IPv4 in canonical form.
+pub fn valid_receiver_ip(value: &str) -> Option<String> {
+    let ip = value.trim().parse::<Ipv4Addr>().ok()?;
+    lan_ipv4(ip).then(|| ip.to_string())
+}
+
 pub fn lan_ip_for(ip: &str) -> Option<Ipv4Addr> {
     let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
     socket.connect((ip, 9)).ok()?;
@@ -185,28 +197,36 @@ pub fn mime_for_dlna(path: &str) -> String {
         .map_or_else(|| "video/mp4".to_string(), |(_, mime)| (*mime).to_string())
 }
 
+/// Whether `path` has one of the audio/video extensions the media server knows.
+pub fn is_media_extension(path: &str) -> bool {
+    let ext = extension(path);
+    MEDIA_TYPES.iter().any(|(name, _)| *name == ext)
+}
+
+const MEDIA_TYPES: &[(&str, &str)] = &[
+    ("mkv", "video/x-matroska"),
+    ("mp4", "video/mp4"),
+    ("m4v", "video/mp4"),
+    ("avi", "video/x-msvideo"),
+    ("mov", "video/quicktime"),
+    ("webm", "video/webm"),
+    ("ts", "video/mp2t"),
+    ("m2ts", "video/mp2t"),
+    ("mpg", "video/mpeg"),
+    ("mpeg", "video/mpeg"),
+    ("wmv", "video/x-ms-wmv"),
+    ("flv", "video/x-flv"),
+    ("mp3", "audio/mpeg"),
+    ("flac", "audio/flac"),
+    ("m4a", "audio/mp4"),
+    ("aac", "audio/aac"),
+    ("ogg", "audio/ogg"),
+    ("wav", "audio/wav"),
+    ("opus", "audio/opus"),
+];
+
 pub fn content_type_for_serve(path: &str, transcode: bool) -> String {
-    const EXT_TYPES: &[(&str, &str)] = &[
-        ("mkv", "video/x-matroska"),
-        ("mp4", "video/mp4"),
-        ("m4v", "video/mp4"),
-        ("avi", "video/x-msvideo"),
-        ("mov", "video/quicktime"),
-        ("webm", "video/webm"),
-        ("ts", "video/mp2t"),
-        ("m2ts", "video/mp2t"),
-        ("mpg", "video/mpeg"),
-        ("mpeg", "video/mpeg"),
-        ("wmv", "video/x-ms-wmv"),
-        ("flv", "video/x-flv"),
-        ("mp3", "audio/mpeg"),
-        ("flac", "audio/flac"),
-        ("m4a", "audio/mp4"),
-        ("aac", "audio/aac"),
-        ("ogg", "audio/ogg"),
-        ("wav", "audio/wav"),
-        ("opus", "audio/opus"),
-    ];
+    const EXT_TYPES: &[(&str, &str)] = MEDIA_TYPES;
     if transcode {
         return "video/mp4".to_string();
     }
@@ -235,6 +255,58 @@ pub fn extension(path: &str) -> String {
         .map_or_else(String::new, |ext| ext.to_string_lossy().to_lowercase())
 }
 
+/// ffmpeg/ffprobe input arguments for a local file: the `file:` prefix and
+/// the protocol whitelist stop a name or a playlist-shaped file from being
+/// opened as anything but a local file (no `http:`, `concat:`, `-option`).
+pub fn ffmpeg_input(path: &Path) -> Vec<String> {
+    vec![
+        "-protocol_whitelist".to_string(),
+        "file".to_string(),
+        "-i".to_string(),
+        format!("file:{}", path.to_string_lossy()),
+    ]
+}
+
+/// Longest an ffprobe run may take; a hung probe must not hold the daemon.
+const FFPROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+/// Most ffprobe output kept; real outputs are a few KiB.
+const FFPROBE_MAX_OUTPUT: u64 = 4 * 1024 * 1024;
+
+/// Run ffprobe on a local file with a deadline and a stdout cap. `None` on
+/// spawn failure or timeout (the process is killed).
+pub fn ffprobe(args: &[&str], path: &Path) -> Option<Vec<u8>> {
+    use std::io::Read;
+    let mut child = std::process::Command::new("ffprobe")
+        .args(args)
+        .args(ffmpeg_input(path))
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+    let stdout = child.stdout.take()?;
+    let reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = stdout.take(FFPROBE_MAX_OUTPUT).read_to_end(&mut bytes);
+        bytes
+    });
+    let deadline = std::time::Instant::now() + FFPROBE_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+    reader.join().ok()
+}
+
 pub fn expand_tilde(path: &str) -> String {
     path.strip_prefix("~/").map_or_else(
         || path.to_string(),
@@ -258,50 +330,6 @@ pub fn random_token() -> String {
         let _ = write!(token, "{byte:02x}");
     }
     token
-}
-
-#[allow(unsafe_code)]
-pub fn kill_pids_on_port(port: u16) {
-    let output = std::process::Command::new("ss")
-        .args(["-ltnp", &format!("sport = :{port}")])
-        .output();
-    let Ok(output) = output else { return };
-    let text = String::from_utf8_lossy(&output.stdout);
-    for (name, pid) in processes_from_ss(&text) {
-        if !is_our_renderer_process(&name) {
-            continue;
-        }
-        // SAFETY: pid comes from `ss` output for our port; killing a stale
-        // process here is the intended self-heal. ESRCH is ignored.
-        unsafe {
-            libc::kill(pid, libc::SIGKILL);
-        }
-    }
-}
-
-fn is_our_renderer_process(name: &str) -> bool {
-    name.contains("omarchy") || name.contains("python")
-}
-
-fn processes_from_ss(text: &str) -> Vec<(String, i32)> {
-    let mut found = Vec::new();
-    let mut rest = text;
-    while let Some(index) = rest.find("((\"") {
-        rest = &rest[index + 3..];
-        let Some((name, tail)) = rest.split_once('"') else {
-            break;
-        };
-        if let Some(pid_start) = tail.find("pid=") {
-            let digits: String = tail[pid_start + 4..]
-                .chars()
-                .take_while(char::is_ascii_digit)
-                .collect();
-            if let Ok(pid) = digits.parse() {
-                found.push((name.to_string(), pid));
-            }
-        }
-    }
-    found
 }
 
 #[allow(unsafe_code)]
@@ -340,6 +368,32 @@ mod tests {
     }
 
     #[test]
+    fn receiver_ips_are_lan_ipv4_only() {
+        assert_eq!(
+            valid_receiver_ip(" 192.168.1.8 "),
+            Some("192.168.1.8".into())
+        );
+        assert_eq!(valid_receiver_ip("10.0.0.2"), Some("10.0.0.2".into()));
+        assert_eq!(valid_receiver_ip("172.16.4.1"), Some("172.16.4.1".into()));
+        assert_eq!(valid_receiver_ip("169.254.3.3"), Some("169.254.3.3".into()));
+        for bad in [
+            "8.8.8.8",
+            "127.0.0.1",
+            "0.0.0.0",
+            "255.255.255.255",
+            "224.0.0.251",
+            "fe80::1",
+            "::1",
+            "any",
+            "10.0.0.0/8",
+            "192.168.1.8 port 22",
+            "",
+        ] {
+            assert_eq!(valid_receiver_ip(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
     fn tilde_expands() {
         assert!(expand_tilde("~/Videos/a.mkv").ends_with("Videos/a.mkv"));
     }
@@ -356,17 +410,5 @@ mod tests {
         );
         assert_eq!(content_type_for_serve("/x/a.mkv", true), "video/mp4");
         assert_eq!(mime_for_dlna("/x/a.flac"), "audio/flac");
-    }
-
-    #[test]
-    fn ss_pid_parsing() {
-        let sample = "LISTEN 0 128 192.168.1.6:60020 0.0.0.0:* users:((\"python3\",pid=1234,fd=3))";
-        assert_eq!(
-            processes_from_ss(sample),
-            vec![("python3".to_string(), 1234)]
-        );
-        assert!(is_our_renderer_process("omarchy-castd"));
-        assert!(is_our_renderer_process("python3"));
-        assert!(!is_our_renderer_process("nginx"));
     }
 }

@@ -83,7 +83,7 @@ The first build takes a minute or two. The panel switches to the device list on
 its own when the daemon answers.
 
 <details>
-<summary><b>Manual build or pacman package</b></summary>
+<summary><b>Manual build</b></summary>
 
 From a checkout of this repository:
 
@@ -92,8 +92,9 @@ cargo build --release --locked
 install -Dm755 target/release/omarchy-castd ~/.local/bin/omarchy-castd
 ```
 
-A `PKGBUILD` is included if you prefer a pacman package: run `makepkg -si` from
-a tagged release.
+The widget only ever runs `~/.local/bin/omarchy-castd` or
+`/usr/bin/omarchy-castd`, never a binary found on `PATH` or inside the plugin
+folder.
 
 </details>
 
@@ -223,6 +224,11 @@ journalctl --user -u omarchy-castd -f
 The daemon logs every receiver request and every ffmpeg command line. Run it
 with `OMARCHY_CAST_LOG=omarchy_castd=debug` for protocol-level detail.
 
+Two more environment variables are read by the daemon: `OMARCHY_CAST_PORT`
+(media server port, default 60020) and `OMARCHY_CAST_VBITRATE` (transcode
+video bitrate in kb/s, default 6000). Set them with
+`systemctl --user set-environment` and restart the unit.
+
 </details>
 
 ## Update and remove
@@ -238,19 +244,26 @@ omarchy plugin remove universal-cast
 ```
 
 The uninstall script keeps your settings in `~/.config/omarchy/cast/`. Pass
-`--purge` to delete them too. Nothing else is left behind.
+`--purge` to delete them too. It does not remove what setup shares with other
+software: packages installed with `omarchy pkg add` (`ffmpeg`, `cmake`,
+`base-devel`, `rustup`), the pinned toolchain in `~/.rustup/`, and the crate
+download cache in `~/.cargo/registry/`. Remove those yourself if nothing else
+uses them.
 
 ## What it touches
 
-Everything is per-user. The only privileged action is the optional firewall
-rule described below.
+The daemon and its state are per-user. Two things need root, and each asks
+first: setup installs missing packages through `omarchy pkg add`, and casting
+may add a firewall rule (below).
 
 | | |
 | --- | --- |
-| **Files** | `~/.local/bin/omarchy-castd` (daemon) · `~/.config/systemd/user/omarchy-castd.service` · `~/.config/omarchy/cast/` (settings, manual IPs, firewall ledger) · `~/.cache/omarchy-cast/` (build output) · `~/.rustup/` (the pinned toolchain, only if it had to be downloaded) · `$XDG_RUNTIME_DIR/universal-cast/` (socket, subtitle cache) |
-| **Processes** | `omarchy-castd`, `ffprobe` per cast, `ffmpeg` while a stream is remuxed or boosted, `xdg-terminal-exec` when you press the install button |
-| **Network** | LAN only: SSDP and mDNS discovery, HTTP/SOAP to the receiver, TLS to Cast devices on port 8009, and a media server on port 60020 bound to your LAN address |
-| **Privilege** | If `ufw` is enabled, casting to a new receiver runs `pkexec ufw allow from <receiver-ip> proto tcp to any port 60020`. Polkit asks each time. The rules are recorded and removed by the uninstall script. |
+| **Files** | `~/.local/bin/omarchy-castd` (daemon) · `~/.config/systemd/user/omarchy-castd.service` · `~/.config/omarchy/cast/` (settings, manual IPs, firewall ledger) · `~/.cache/omarchy-cast/` (build output) · `~/.rustup/` (the pinned toolchain, only if it had to be downloaded) · `~/.cargo/registry/` (crate downloads) · `$XDG_RUNTIME_DIR/universal-cast/` (socket, subtitle cache) |
+| **Packages** | Setup installs whichever of `ffmpeg`, `cmake`, `base-devel`, `rustup` are missing, with `omarchy pkg add` (system-wide; it asks first) |
+| **Services** | The `omarchy-castd.service` user unit, enabled (`WantedBy=default.target`) so the daemon starts at login; managed with `systemctl --user` |
+| **Processes** | `omarchy-castd`, `ffprobe` per cast (15 s limit), `ffmpeg` while a stream is remuxed, boosted or a subtitle converted, `omarchy file select` for the file picker, `xdg-terminal-exec` when you press the install button, `pkexec ufw` for the firewall rule |
+| **Network** | LAN only: receivers must have a private or link-local IPv4 address (anything else is refused, typed or discovered). SSDP and mDNS discovery, HTTP/SOAP to the receiver, TLS to Cast devices on port 8009, and a media server on port 60020 bound to your LAN address that closes connections from any host but the receiver. Cast devices present self-signed certificates, so that TLS channel is encrypted but the certificate is not verified. |
+| **Privilege** | If `ufw` is enabled, casting to a new receiver runs `pkexec ufw allow from <receiver-ip> proto tcp to <your-lan-ip> port 60020`. Polkit asks each time. The rules are recorded, and the uninstall script (or `omarchy-castd --client clear-firewall`) removes exactly those; a matching rule you added yourself is never recorded or removed. |
 | **Media players** | Reads the current file from MPRIS players over D-Bus |
 | **Your config** | Never edits `shell.json`; bar placement goes through `omarchy plugin enable` |
 
@@ -262,7 +275,9 @@ rule described below.
   - are XML-escaped in DLNA metadata.
 
   In addition, SSDP answers may only describe the host that sent them, device descriptions are size-capped and never follow redirects, and a device's control URLs must point back at itself.
-- **Reproducible build.** The compiler is pinned to one exact Rust release, which rustup verifies against the signed release manifests. Crates are pinned and checksummed by `Cargo.lock` and built with `--locked`. CI actions are pinned to full commit SHAs.
+- **Reproducible build.** The compiler is pinned to one exact Rust release, which rustup downloads over HTTPS from `static.rust-lang.org` and checks against the SHA-256 sums in that release's channel manifest. Crates are pinned and checksummed by `Cargo.lock` and built with `--locked`. CI actions are pinned to full commit SHAs.
+- **Owns only what it made.** The daemon never signals processes it did not start; if the media port is taken it reports that. The uninstall script stops only a daemon whose executable is the binary it installed. Firewall ledger lines that are not a rule the daemon could have written are ignored.
+- **Local files stay local files.** ffmpeg and ffprobe get absolute paths as `file:` inputs with a `file`-only protocol whitelist. A file reported by a media player over MPRIS is cast only if it has an audio/video extension and ffprobe finds an audio or video stream. Subtitle sidecars must be regular files under 8 MiB, converted tracks are capped at 16 MiB, and at most 32 tracks are offered.
 - **Private state.** Runtime and config state is owner-only (mode 0700, socket 0600).
 - **Review before enabling.** Like every Omarchy plugin, the widget runs unsandboxed inside the shell, so review the code first. Marketplace listing is not a security audit. See [SECURITY.md](SECURITY.md) to report a vulnerability.
 

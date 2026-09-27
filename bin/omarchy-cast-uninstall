@@ -11,6 +11,7 @@
 set -uo pipefail
 
 PURGE=0
+KEEP_LEDGER=0
 for arg in "$@"; do
   case $arg in
     --purge) PURGE=1 ;;
@@ -35,7 +36,10 @@ if [[ -s $CONFIG/firewall-rules ]]; then
     "$BIN" --client clear-firewall >/dev/null 2>&1 || true
   fi
   if [[ -s $CONFIG/firewall-rules ]]; then
-    say "some ufw rules may remain; list them with: sudo ufw status | grep universal-cast"
+    say "these ufw rules were not removed; delete them with sudo ufw delete, or list them with: sudo ufw status | grep universal-cast"
+    sed 's/^/    /' "$CONFIG/firewall-rules"
+    # Keep the record even with --purge, so a later run can still remove them.
+    KEEP_LEDGER=1
   fi
 fi
 
@@ -50,7 +54,15 @@ if systemctl --user list-unit-files "$UNIT" >/dev/null 2>&1; then
 fi
 rm -f "$UNIT_FILE"
 systemctl --user daemon-reload >/dev/null 2>&1 || true
-pkill -x omarchy-castd >/dev/null 2>&1 || true
+# A daemon started outside systemd (the client's fallback) survives the unit
+# stop. Signal only processes of this user whose executable is the binary
+# removed above, never anything that merely shares the name.
+for pid in $(pgrep -u "$(id -u)" -x omarchy-castd 2>/dev/null); do
+  exe=$(readlink "/proc/$pid/exe" 2>/dev/null) || continue
+  if [[ $exe == "$BIN" || $exe == "$BIN (deleted)" ]]; then
+    kill "$pid" 2>/dev/null || true
+  fi
+done
 say "stopped and removed $UNIT"
 
 # 3. Runtime state.
@@ -58,7 +70,10 @@ rm -rf "$RUNTIME"
 say "removed $BIN, $CACHE and runtime state"
 
 # 4. Settings only on request.
-if (( PURGE )); then
+if (( PURGE )) && (( KEEP_LEDGER )); then
+  find "$CONFIG" -mindepth 1 -maxdepth 1 ! -name firewall-rules -exec rm -rf -- {} +
+  say "removed settings in $CONFIG except firewall-rules (rules above still exist)"
+elif (( PURGE )); then
   rm -rf "$CONFIG"
   say "removed settings in $CONFIG"
 else

@@ -11,8 +11,9 @@
 #
 # The pin is an exact release, never a moving channel, so a given plugin commit
 # always compiles with the same compiler. rustup downloads that release only if
-# it is missing and verifies it against the signed release manifests; the crate
-# graph is pinned and checksummed by Cargo.lock.
+# it is missing, over HTTPS from static.rust-lang.org, and checks every
+# component against the SHA-256 listed in that release's channel manifest; the
+# crate graph is pinned and checksummed by Cargo.lock.
 set -euo pipefail
 
 HERE=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
@@ -56,7 +57,7 @@ command -v rustup >/dev/null || command -v cargo >/dev/null \
 
 if command -v rustup >/dev/null; then
   if ! rustup toolchain list 2>/dev/null | cut -d' ' -f1 | grep -Eq "^${PINNED}(-|$)"; then
-    say "installing Rust $PINNED (checksum-verified against the signed release manifests)"
+    say "installing Rust $PINNED (SHA-256 checked against its channel manifest)"
     rustup toolchain install "$PINNED" --profile minimal \
       --component rustfmt --component clippy --no-self-update
   fi

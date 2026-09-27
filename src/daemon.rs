@@ -175,7 +175,7 @@ fn serve_plan(device: &Device, path: &str, token: &str, boost: i32) -> ServePlan
         device.protocol != "cast" || matches!(extension.as_str(), "mp4" | "m4v" | "mov");
     let direct = boost == 0 && codec.vcodec == "copy" && codec.acodec == "copy" && container_ok;
     tracing::info!(
-        "serve plan for {path}: {}; {}{}",
+        "serve plan for {path:?}: {}; {}{}",
         codec.reason,
         if direct { "direct" } else { "ffmpeg" },
         if boost > 0 {
@@ -414,23 +414,47 @@ impl Daemon {
     #[allow(clippy::too_many_lines)]
     async fn connect(self: &Arc<Self>, ip: &str, file: &str) -> Value {
         let _action = self.action.lock().await;
-        let Some(ip) = util::valid_ip(ip) else {
-            return error_response("Invalid receiver address");
+        let Some(ip) = util::valid_receiver_ip(ip) else {
+            return error_response("Receivers must be on the local network (private IPv4)");
         };
         let mut path = file.to_string();
-        if path.is_empty() {
+        let from_player = path.is_empty();
+        if from_player {
             path = mpris::current_file().await.unwrap_or_default();
             if path.is_empty() {
                 return error_response("Play a file in a media player first, or paste a file path");
             }
         }
         path = util::expand_tilde(&path);
+        // Absolute only, so ffmpeg/ffprobe can never read the argument as an
+        // option ("-…") or a protocol URL ("x:…").
+        if !Path::new(&path).is_absolute() {
+            return error_response("Give the full path to the file");
+        }
         if !Path::new(&path).is_file() {
             return error_response("File not found");
+        }
+        // Any program on the session bus can claim to be a media player; only
+        // cast what it reports if the file really is audio or video.
+        if from_player {
+            let probe_path = PathBuf::from(&path);
+            let is_media = tokio::task::spawn_blocking(move || cast::has_media_stream(&probe_path))
+                .await
+                .unwrap_or(false);
+            if !is_media {
+                return error_response("The media player's current file is not audio or video");
+            }
         }
         let Some(bind) = util::lan_ip_for(&ip) else {
             return error_response(&format!("No route to {ip}"));
         };
+        // The route must leave through a LAN address too: a full-tunnel VPN
+        // would otherwise put the media server on the tunnel interface.
+        if !util::lan_ipv4(bind) {
+            return error_response(&format!(
+                "{ip} is reached through {bind}, which is not a local network address"
+            ));
+        }
 
         // Publish "connecting" before anything slow (device lookup, ffprobe,
         // receiver handshake) so the panel reflects the click right away.
@@ -499,10 +523,10 @@ impl Daemon {
         };
         if !subtitle_tracks.is_empty() {
             tracing::info!(
-                "subtitles for {path}: {}",
+                "subtitles for {path:?}: {}",
                 subtitle_tracks
                     .iter()
-                    .map(|track| format!("{}={}", track.id, track.label))
+                    .map(|track| format!("{}={:?}", track.id, track.label))
                     .collect::<Vec<_>>()
                     .join(", ")
             );
@@ -516,7 +540,7 @@ impl Daemon {
             session.subtitle = subtitle;
         }
 
-        if !firewall::open(&ip).await {
+        if !firewall::open(&ip, bind, port).await {
             self.disconnect_locked().await;
             self.reset_session();
             return error_response("Firewall authorization was declined");
@@ -605,7 +629,6 @@ impl Daemon {
         session_id: u64,
     ) -> Result<(), String> {
         let plan = serve_plan(&context.device, &context.path, &context.token, boost);
-        util::kill_pids_on_port(context.port);
         let url = self.start_media(&context, &plan).await?;
         let options = cast::CastOptions {
             duration: context.duration,
@@ -660,7 +683,6 @@ impl Daemon {
             .ok_or_else(|| format!("No DLNA control endpoint for {}", context.ip))?;
         let rendering = context.device.rendering_url.clone();
         let plan = serve_plan(&context.device, &context.path, &context.token, boost);
-        util::kill_pids_on_port(context.port);
         let url = self.start_media(&context, &plan).await?;
         let mime = plan.mime_for_dlna(&context.path);
         dlna::play(&control, &url, &context.title, &mime)
@@ -693,7 +715,6 @@ impl Daemon {
         session_id: u64,
     ) -> Result<(), String> {
         let plan = serve_plan(&context.device, &context.path, &context.token, boost);
-        util::kill_pids_on_port(context.port);
         let url = self.start_media(&context, &plan).await?;
         let airplay_port = if context.device.port == 0 {
             7000
@@ -1268,8 +1289,8 @@ impl Daemon {
     }
 
     async fn add_ip(&self, ip: &str) -> Value {
-        let Some(ip) = util::valid_ip(ip) else {
-            return error_response("Invalid address");
+        let Some(ip) = util::valid_receiver_ip(ip) else {
+            return error_response("Enter a local network address (private IPv4)");
         };
         let mut ips = settings::manual_ips();
         if !ips.contains(&ip) {

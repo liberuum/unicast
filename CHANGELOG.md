@@ -1,5 +1,51 @@
 # Changelog
 
+## 0.1.4 — 2026-09-27
+
+### Security
+
+Marketplace review of 0.1.3, plus an audit for the same class of issue:
+
+- The daemon no longer kills whatever listens on the media port. It stops its
+  own previous server in-process and reports a port held by another program
+  instead of reclaiming it.
+- The uninstall script signals only a daemon whose executable is the binary
+  it installed (was `pkill -x omarchy-castd`).
+- Receivers must be private or link-local IPv4. Public, loopback, multicast
+  and IPv6 addresses are refused in `connect`, `add-ip`, manual IPs and
+  discovery results, and the media server refuses to bind a non-LAN address
+  (for example a full-tunnel VPN).
+- ufw rules are scoped to the LAN address the media server binds
+  (`to <lan-ip> port <port>`, was `to any`), the ledger records receiver,
+  address and port, and lines that are not a rule the daemon could have
+  written are ignored instead of being passed to `ufw delete`. A matching
+  rule that already existed is not recorded, so it is never deleted.
+- The media server closes connections from any host but the receiver at
+  accept time, before any request is read.
+- ffprobe runs with a 15 s deadline and a 4 MiB output cap. ffmpeg and
+  ffprobe get `file:` inputs with `-protocol_whitelist file`, and cast paths
+  must be absolute.
+- A file reported over MPRIS is cast only with an audio/video extension and
+  an audio or video stream; the D-Bus lookup is limited to 3 s.
+- Subtitle sidecars must be regular files (no symlinks) under 8 MiB, converted
+  WebVTT is capped at 16 MiB, and at most 32 tracks are offered.
+- The client starts and registers only `~/.local/bin/omarchy-castd` or
+  `/usr/bin/omarchy-castd` (no `PATH` lookup, no in-tree binaries), refuses
+  unit-file-unsafe paths, and calls `/usr/bin/systemctl`.
+- File names, track titles and receiver errors are debug-escaped in logs.
+- Discovery never probes this machine's own address.
+
+### Changed
+
+- The `PKGBUILD` is removed: it always lagged the release it described and
+  built with the distro compiler instead of the pinned one. Setup is the
+  supported install.
+- `tests/run` builds with `--locked` and fails if any cargo build in setup,
+  tests or CI does not; the CI cache is written only from `main`.
+- README "What it touches" now lists package installs, the login-enabled user
+  unit, the crate cache left behind, the unverified Cast TLS certificate and
+  the environment variables.
+
 ## 0.1.3 — 2026-09-26
 
 ### Fixed
