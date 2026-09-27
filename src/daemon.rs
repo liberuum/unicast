@@ -543,10 +543,10 @@ impl Daemon {
             session.subtitle = subtitle;
         }
 
-        if !firewall::open(&ip, bind, port).await {
+        if let Err(error) = firewall::open(&ip, bind, port).await {
             self.disconnect_locked().await;
             self.reset_session();
-            return error_response("Firewall authorization was declined");
+            return error_response(&error);
         }
 
         let context = ServeContext {

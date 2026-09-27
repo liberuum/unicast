@@ -92,6 +92,10 @@ cargo build --release --locked
 install -Dm755 target/release/omarchy-castd ~/.local/bin/omarchy-castd
 ```
 
+A binary installed this way is not recorded as UniCast's, so the setup
+script will not replace it and the uninstall script will not delete it;
+remove it yourself, or delete it before running setup.
+
 The widget only ever runs `~/.local/bin/omarchy-castd` or
 `/usr/bin/omarchy-castd`, never a binary found on `PATH` or inside the plugin
 folder.
@@ -244,7 +248,9 @@ omarchy plugin remove universal-cast
 ```
 
 The uninstall script keeps your settings in `~/.config/omarchy/cast/`. Pass
-`--purge` to delete them too. It does not remove what setup shares with other
+`--purge` to delete them too. It removes only files UniCast created: a
+binary, unit or cache folder at those paths that belongs to something else is
+kept and reported. It does not remove what setup shares with other
 software: packages installed with `omarchy pkg add` (`ffmpeg`, `cmake`,
 `base-devel`, `rustup`), the pinned toolchain in `~/.rustup/`, and the crate
 download cache in `~/.cargo/registry/`. Remove those yourself if nothing else
@@ -258,12 +264,12 @@ may add a firewall rule (below).
 
 | | |
 | --- | --- |
-| **Files** | `~/.local/bin/omarchy-castd` (daemon) · `~/.config/systemd/user/omarchy-castd.service` · `~/.config/omarchy/cast/` (settings, manual IPs, firewall ledger) · `~/.cache/omarchy-cast/` (build output) · `~/.rustup/` (the pinned toolchain, only if it had to be downloaded) · `~/.cargo/registry/` (crate downloads) · `$XDG_RUNTIME_DIR/universal-cast/` (socket, subtitle cache) |
+| **Files** | `~/.local/bin/omarchy-castd` (daemon) · `~/.config/systemd/user/omarchy-castd.service` · `~/.config/omarchy/cast/` (settings, manual IPs, firewall ledger) · `~/.cache/universal-cast/` (build output; releases before 0.1.6 used `~/.cache/omarchy-cast/`, which is never deleted since nothing proves who created it) · `~/.rustup/` (the pinned toolchain, only if it had to be downloaded) · `~/.cargo/registry/` (crate downloads) · `$XDG_RUNTIME_DIR/universal-cast/` (socket, subtitle cache) |
 | **Packages** | Setup installs whichever of `ffmpeg`, `cmake`, `base-devel`, `rustup` are missing, with `omarchy pkg add` (system-wide; it asks first) |
 | **Services** | The `omarchy-castd.service` user unit, enabled (`WantedBy=default.target`) so the daemon starts at login; managed with `systemctl --user`. It runs with `UMask=0077`, `TasksMax=1024`, `MemoryMax=4G`, `OOMScoreAdjust=200` and `KeyringMode=private`. systemd's namespace and seccomp sandboxing is not used: in a user unit those options imply `PrivateUsers=` or `NoNewPrivileges=`, which would block the `pkexec ufw` prompt. |
 | **Processes** | `omarchy-castd`, `ffprobe` per cast (15 s limit), `ffmpeg` while a stream is remuxed, boosted or a subtitle converted, `omarchy file select` for the file picker, `xdg-terminal-exec` when you press the install button, `pkexec ufw` for the firewall rule |
 | **Network** | LAN only: receivers must have a private or link-local IPv4 address (anything else is refused, typed or discovered). SSDP discovery, mDNS on the LAN interface only (never IPv6, VPN or container interfaces), HTTP/SOAP to the receiver, TLS to Cast devices on port 8009, and a media server on port 60020 bound to your LAN address that closes connections from any host but the receiver. Cast devices present self-signed certificates, so that TLS channel is encrypted but the certificate is not verified. |
-| **Privilege** | If `ufw` is enabled, casting to a new receiver runs `pkexec ufw allow from <receiver-ip> proto tcp to <your-lan-ip> port 60020`. Polkit asks each time. The rules are recorded, and the uninstall script (or `omarchy-castd --client clear-firewall`) removes exactly those; a matching rule you added yourself is never recorded or removed. |
+| **Privilege** | If `ufw` is enabled, casting to a new receiver runs `pkexec ufw allow from <receiver-ip> proto tcp to <your-lan-ip> port 60020`. Polkit asks each time. The rules are recorded, and the uninstall script (or `omarchy-castd --client clear-firewall`) removes exactly those. If you already have a rule for the same receiver, address and port (allow or deny, any comment), it is left exactly as it is: ufw would otherwise replace it with UniCast's. Only a rule ufw reports as newly added is recorded. |
 | **Media players** | Reads the current file from MPRIS players over D-Bus |
 | **Your config** | Never edits `shell.json`; bar placement goes through `omarchy plugin enable` |
 
@@ -276,7 +282,7 @@ may add a firewall rule (below).
 
   In addition, SSDP answers may only describe the host that sent them, device descriptions are size-capped and never follow redirects, and a device's control URLs must point back at itself.
 - **Reproducible build.** The compiler is pinned to one exact Rust release, which rustup downloads over HTTPS from `static.rust-lang.org` and checks against the SHA-256 sums in that release's channel manifest. Crates are pinned and checksummed by `Cargo.lock` and built with `--locked`. CI actions are pinned to full commit SHAs.
-- **Owns only what it made.** The daemon never signals processes it did not start; if the media port is taken it reports that. The uninstall script stops only a daemon whose executable is the binary it installed. Firewall ledger lines that are not a rule the daemon could have written are ignored.
+- **Owns only what it made.** Setup records the SHA-256 of the binary it installs and never replaces a `~/.local/bin/omarchy-castd` that does not match it. The client writes `omarchy-castd.service` only when no such file exists or the existing one carries UniCast's marker line (it writes a fresh file and renames it into place, never through a symlink); a unit someone else wrote is not rewritten, enabled or started. Setup uses a build cache folder only if it created it (marking it in the same step) and refuses one that already exists unmarked. The uninstall script deletes the binary, unit, build cache and settings only when those checks say they are UniCast's, and it talks only to a daemon that is already running, so it never installs or starts one. The daemon never signals processes it did not start; if the media port is taken it reports that. The uninstall script stops only a daemon whose executable is the binary it installed. Firewall ledger lines that are not a rule the daemon could have written are ignored.
 - **The file you chose is the file that is sent.** It is opened once when the cast starts and served from that open descriptor (to ffmpeg as `/proc/<pid>/fd/<n>`), so replacing or re-pointing the path mid-cast changes nothing.
 - **Local files stay local files.** ffmpeg and ffprobe get absolute paths as `file:` inputs with a `file`-only protocol whitelist. A file reported by a media player over MPRIS is cast only if it has an audio/video extension and ffprobe finds an audio or video stream. Subtitle sidecars must be regular files under 8 MiB, converted tracks are capped at 16 MiB, and at most 32 tracks are offered.
 - **Private state.** Runtime and config state is owner-only (mode 0700, socket 0600).

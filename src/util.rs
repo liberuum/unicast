@@ -267,7 +267,23 @@ pub struct PinnedFile {
 
 impl PinnedFile {
     pub fn open(path: &Path) -> std::io::Result<Self> {
-        let file = fs::File::open(path)?;
+        Self::open_with(path, 0)
+    }
+
+    /// Like `open`, but refuses a symlink at `path` itself.
+    pub fn open_no_follow(path: &Path) -> std::io::Result<Self> {
+        Self::open_with(path, libc::O_NOFOLLOW)
+    }
+
+    /// `O_NONBLOCK` so that opening a FIFO (or a device) returns at once
+    /// instead of blocking until a writer appears; the regular-file check on
+    /// the opened descriptor then refuses it.
+    fn open_with(path: &Path, flags: libc::c_int) -> std::io::Result<Self> {
+        use std::os::unix::fs::OpenOptionsExt;
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK | flags)
+            .open(path)?;
         if !file.metadata()?.is_file() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -440,6 +456,27 @@ mod tests {
             b"the chosen movie"
         );
         assert!(PinnedFile::open(&dir).is_err());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[allow(unsafe_code)]
+    fn pinned_file_refuses_fifos_and_links_without_blocking() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = std::env::temp_dir().join(format!("unicast-fifo-{}", random_token()));
+        fs::create_dir_all(&dir).expect("dir");
+        let fifo = dir.join("movie.mp4");
+        let name = std::ffi::CString::new(fifo.as_os_str().as_bytes()).expect("path");
+        // SAFETY: mkfifo gets a valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        // With no writer, a blocking open would hang this test forever.
+        assert!(PinnedFile::open(&fifo).is_err());
+        let real = dir.join("real.srt");
+        fs::write(&real, b"1\n").expect("write");
+        let link = dir.join("link.srt");
+        std::os::unix::fs::symlink(&real, &link).expect("link");
+        assert!(PinnedFile::open_no_follow(&link).is_err());
+        assert!(PinnedFile::open_no_follow(&real).is_ok());
         let _ = fs::remove_dir_all(&dir);
     }
 

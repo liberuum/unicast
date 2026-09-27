@@ -51,7 +51,21 @@ fn new_socket(lan_ip: Ipv4Addr) -> std::io::Result<UdpSocket> {
     Ok(socket.into())
 }
 
+/// Only LAN senders: the description is fetched from the sender, and
+/// nothing off the LAN is ever contacted.
+fn lan_sender(ip: IpAddr) -> bool {
+    matches!(ip, IpAddr::V4(ip) if util::lan_ipv4(ip))
+}
+
 fn collect_locations(socket: &UdpSocket, window: Duration) -> HashSet<String> {
+    collect_locations_from(socket, window, lan_sender)
+}
+
+fn collect_locations_from(
+    socket: &UdpSocket,
+    window: Duration,
+    accept: impl Fn(IpAddr) -> bool,
+) -> HashSet<String> {
     let deadline = Instant::now() + window;
     let mut locations = HashSet::new();
     let mut per_host: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
@@ -59,6 +73,9 @@ fn collect_locations(socket: &UdpSocket, window: Duration) -> HashSet<String> {
     while Instant::now() < deadline {
         match socket.recv_from(&mut buffer) {
             Ok((len, from)) => {
+                if !accept(from.ip()) {
+                    continue;
+                }
                 let text = String::from_utf8_lossy(&buffer[..len]);
                 let sender = from.ip().to_string();
                 for line in text.split("\r\n") {
@@ -623,6 +640,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn ssdp_replies_from_off_the_lan_are_dropped() {
+        let listener = UdpSocket::bind("127.0.0.1:0").expect("bind");
+        listener
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .expect("timeout");
+        let sender = UdpSocket::bind("127.0.0.1:0").expect("bind sender");
+        sender
+            .send_to(
+                b"HTTP/1.1 200 OK\r\nLOCATION: http://127.0.0.1:1900/desc.xml\r\n\r\n",
+                listener.local_addr().expect("addr"),
+            )
+            .expect("send");
+        assert!(collect_locations(&listener, Duration::from_millis(400)).is_empty());
+        assert!(lan_sender("192.168.1.8".parse().expect("ip")));
+        for ip in ["100.64.0.1", "8.8.8.8", "127.0.0.1", "fe80::1"] {
+            assert!(!lan_sender(ip.parse().expect("ip")), "{ip}");
+        }
+    }
+
+    #[test]
     fn ssdp_replies_are_capped_per_host() {
         let listener = UdpSocket::bind("127.0.0.1:0").expect("bind");
         listener
@@ -644,7 +681,8 @@ mod tests {
                 target,
             )
             .expect("send");
-        let locations = collect_locations(&listener, Duration::from_millis(500));
+        // Loopback stands in for a LAN host here; the LAN filter is below.
+        let locations = collect_locations_from(&listener, Duration::from_millis(500), |_| true);
         assert_eq!(locations.len(), MAX_LOCATIONS_PER_HOST);
         assert!(
             locations

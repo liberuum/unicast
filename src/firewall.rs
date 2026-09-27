@@ -7,6 +7,9 @@ use crate::util;
 const UFW: &str = "/usr/bin/ufw";
 const PKEXEC: &str = "/usr/bin/pkexec";
 const TIMEOUT: Duration = Duration::from_secs(60);
+/// ufw's saved rules; world-readable on Arch. Read to see what already exists.
+const USER_RULES: &str = "/etc/ufw/user.rules";
+const USER_RULES_MAX: u64 = 4 * 1024 * 1024;
 
 pub fn active() -> bool {
     std::fs::read_to_string("/etc/ufw/ufw.conf").is_ok_and(|text| text.contains("ENABLED=yes"))
@@ -101,33 +104,60 @@ fn write_ledger(rules: &[Rule]) {
 }
 
 /// Allow `receiver` to reach the media server on `bind:port` only.
-pub async fn open(receiver: &str, bind: Ipv4Addr, port: u16) -> bool {
+pub async fn open(receiver: &str, bind: Ipv4Addr, port: u16) -> Result<(), String> {
     if !active() {
-        return true;
+        return Ok(());
     }
     let (Some(receiver), true) = (util::valid_receiver_ip(receiver), util::lan_ipv4(bind)) else {
-        return false;
+        return Err("Firewall rule refused: not a LAN receiver".into());
     };
     let bind = bind.to_string();
     let mut rules = ledger_rules();
     if rules.iter().any(|rule| rule.covers(&receiver, &bind, port)) {
-        return true;
+        return Ok(());
     }
     let rule = Rule {
         receiver,
         bind,
         port,
     };
+    // `ufw allow` does not skip a rule for the same traffic that differs only
+    // in action or comment: it replaces it with ours ("Rule updated"), turning
+    // a user's deny into an allow, and `clear` would later delete it. Any such
+    // rule is the user's decision, so it is left exactly as it is.
+    match read_user_rules() {
+        Some(text) if user_has_rule(&text, &rule) => {
+            tracing::info!(
+                "ufw already has a rule for {} -> {}:{}; leaving it as it is",
+                rule.receiver,
+                rule.bind,
+                rule.port
+            );
+            return Ok(());
+        }
+        Some(_) => {}
+        None => {
+            return Err(format!(
+                "Cannot read {USER_RULES} to check for a rule of yours, so the firewall was not changed. Allow the receiver yourself: sudo ufw allow from {} proto tcp to {} port {}",
+                rule.receiver, rule.bind, rule.port
+            ));
+        }
+    }
     let mut args = vec!["allow".to_string()];
     args.extend(rule.ufw_args());
     let Some(stdout) = run_output(&args).await else {
-        return false;
+        return Err("Firewall authorization was declined".into());
     };
     if rule_was_added(&stdout) {
         rules.push(rule);
         write_ledger(&rules);
+    } else {
+        tracing::warn!(
+            "ufw did not add a new rule ({}); not recording it",
+            stdout.trim()
+        );
     }
-    true
+    Ok(())
 }
 
 /// Delete exactly the rules recorded in the ledger, nothing else.
@@ -178,10 +208,47 @@ async fn run_output(args: &[String]) -> Option<String> {
     }
 }
 
-/// ufw exits 0 without adding anything when an identical rule exists; that
-/// rule is the user's, so it must not enter the ledger (and later be deleted).
+fn read_user_rules() -> Option<String> {
+    use std::io::Read;
+    let mut text = String::new();
+    std::fs::File::open(USER_RULES)
+        .ok()?
+        .take(USER_RULES_MAX)
+        .read_to_string(&mut text)
+        .ok()?;
+    Some(text)
+}
+
+/// Whether ufw's saved rules hold one for the same traffic as `rule` (tcp from
+/// the receiver to bind:port, inbound on any interface), whatever its action,
+/// logging or comment: exactly the rules `ufw allow` would replace.
+fn user_has_rule(user_rules: &str, rule: &Rule) -> bool {
+    let port = rule.port.to_string();
+    let bare = |address: &str| address.strip_suffix("/32").unwrap_or(address).to_string();
+    user_rules.lines().any(|line| {
+        let Some(tuple) = line.strip_prefix("### tuple ###") else {
+            return false;
+        };
+        let fields: Vec<&str> = tuple.split_whitespace().collect();
+        // action proto dport dst sport src direction [comment=...]
+        let fields = match fields.as_slice() {
+            [head @ .., last] if last.starts_with("comment=") => head,
+            all => all,
+        };
+        matches!(
+            fields,
+            [_, "tcp", dport, dst, "any", src, "in"]
+                if *dport == port && bare(dst) == rule.bind && bare(src) == rule.receiver
+        )
+    })
+}
+
+/// Only ufw's "Rule added" means a new rule of ours exists. It exits 0 with
+/// "Skipping adding existing rule" for an identical rule and "Rule updated"
+/// when it replaced one; either rule is the user's and must not enter the
+/// ledger (and later be deleted).
 fn rule_was_added(stdout: &str) -> bool {
-    !stdout.contains("Skipping")
+    stdout.lines().any(|line| line.trim() == "Rule added")
 }
 
 #[cfg(test)]
@@ -221,6 +288,33 @@ mod tests {
     fn existing_user_rules_are_not_claimed() {
         assert!(rule_was_added("Rule added\n"));
         assert!(!rule_was_added("Skipping adding existing rule\n"));
+        assert!(!rule_was_added("Rule updated\n"));
+        assert!(!rule_was_added("Rules updated\n"));
+    }
+
+    #[test]
+    fn a_users_rule_for_the_same_traffic_is_left_alone() {
+        let rule = Rule::parse("192.168.1.8 192.168.1.6 60020", 1).expect("rule");
+        for tuple in [
+            "### tuple ### deny tcp 60020 192.168.1.6 any 192.168.1.8 in",
+            "### tuple ### allow tcp 60020 192.168.1.6 any 192.168.1.8 in",
+            "### tuple ### allow_log tcp 60020 192.168.1.6/32 any 192.168.1.8/32 in comment=6d696e65",
+        ] {
+            assert!(
+                user_has_rule(&format!("*filter\n{tuple}\n"), &rule),
+                "{tuple}"
+            );
+        }
+        for tuple in [
+            "### tuple ### deny tcp 60021 192.168.1.6 any 192.168.1.8 in",
+            "### tuple ### deny udp 60020 192.168.1.6 any 192.168.1.8 in",
+            "### tuple ### deny tcp 60020 0.0.0.0/0 any 192.168.1.8 in",
+            "### tuple ### deny tcp 60020 192.168.1.6 any 192.168.1.9 in",
+            "### tuple ### deny tcp 60020 192.168.1.6 any 192.168.1.8 in_eth0",
+            "# deny tcp 60020 192.168.1.6 any 192.168.1.8 in",
+        ] {
+            assert!(!user_has_rule(tuple, &rule), "{tuple}");
+        }
     }
 
     #[test]

@@ -1,6 +1,7 @@
 use std::collections::BTreeSet;
 use std::fs;
 use std::io::Write;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::sync::Mutex;
 
@@ -22,8 +23,15 @@ static WRITE_LOCK: Mutex<()> = Mutex::new(());
 /// leaves either the old or the new contents, never a truncated file.
 fn write_atomic(path: &Path, body: &str) -> std::io::Result<()> {
     let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
+    // A leftover or planted file at the temp name is unlinked (never followed),
+    // then the temp is created fresh so nothing is written through a link.
+    let _ = fs::remove_file(&tmp);
     let result = (|| {
-        let mut file = fs::File::create(&tmp)?;
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp)?;
         file.write_all(body.as_bytes())?;
         file.sync_all()?;
         fs::rename(&tmp, path)

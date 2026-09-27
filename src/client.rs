@@ -10,7 +10,14 @@ use crate::util;
 
 const UNIT_NAME: &str = "omarchy-castd.service";
 
-const UNIT_HEAD: &str = "[Unit]
+/// First line of every unit the client writes. The client rewrites, and the
+/// uninstall script removes, only a unit that carries it (or a byte-exact
+/// unit from a release before the marker, see `legacy_units`).
+const UNIT_MARKER: &str =
+    "# Written by UniCast (universal-cast); omarchy-cast-uninstall removes it.";
+
+const UNIT_HEAD: &str = "# Written by UniCast (universal-cast); omarchy-cast-uninstall removes it.
+[Unit]
 Description=omarchy-cast media daemon
 
 [Service]
@@ -137,21 +144,79 @@ fn systemctl(args: &[&str]) -> bool {
         .is_ok_and(|status| status.success())
 }
 
-fn install_unit(executable: &Path) -> bool {
+/// The exact unit files releases before 0.1.6 wrote for a trusted binary,
+/// which had no marker line. Only these byte-for-byte are taken as ours.
+fn legacy_units() -> Vec<String> {
+    const OLD_TAIL: &str =
+        "Restart=on-failure\nRestartSec=1\n\n[Install]\nWantedBy=default.target\n";
+    let head = UNIT_HEAD
+        .strip_prefix(UNIT_MARKER)
+        .and_then(|rest| rest.strip_prefix('\n'))
+        .unwrap_or(UNIT_HEAD);
+    [
+        util::home().join(".local/bin/omarchy-castd"),
+        std::path::PathBuf::from("/usr/bin/omarchy-castd"),
+    ]
+    .iter()
+    .flat_map(|path| {
+        let exec = format!("ExecStart=\"{}\"\n", path.display());
+        [
+            format!("{head}{exec}{OLD_TAIL}"),
+            format!("{head}{exec}{UNIT_TAIL}"),
+        ]
+    })
+    .collect()
+}
+
+fn owns_unit(current: &str) -> bool {
+    current.lines().next() == Some(UNIT_MARKER) || legacy_units().iter().any(|unit| unit == current)
+}
+
+/// Writes the login unit, unless a file the client did not write already has
+/// its name: then it is left alone (not rewritten, enabled or started) and
+/// the caller falls back to running the daemon outside systemd.
+fn install_unit(directory: &Path, executable: &Path) -> bool {
+    use std::os::unix::fs::OpenOptionsExt;
+
     let unit = format!(
         "{UNIT_HEAD}ExecStart=\"{}\"\n{UNIT_TAIL}",
         executable.display()
     );
-    let directory = util::systemd_user_dir();
     let path = directory.join(UNIT_NAME);
-    let current = std::fs::read_to_string(&path).unwrap_or_default();
-    if current == unit {
-        return true;
+    match std::fs::symlink_metadata(&path) {
+        Ok(meta) if !meta.file_type().is_file() => return false,
+        Ok(_) => {
+            let Ok(current) = std::fs::read_to_string(&path) else {
+                return false;
+            };
+            if current == unit {
+                return true;
+            }
+            if !owns_unit(&current) {
+                return false;
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return false,
     }
-    if std::fs::create_dir_all(&directory).is_err() {
+    if std::fs::create_dir_all(directory).is_err() {
         return false;
     }
-    if std::fs::write(&path, unit).is_err() {
+    // A fresh sibling file renamed over the unit: never writes through a
+    // symlink or into a file someone else holds open.
+    let tmp = directory.join(format!(".{UNIT_NAME}.{}", std::process::id()));
+    let written = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o644)
+        .open(&tmp)
+        .and_then(|mut file| {
+            file.write_all(unit.as_bytes())?;
+            file.sync_all()
+        })
+        .and_then(|()| std::fs::rename(&tmp, &path));
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
         return false;
     }
     systemctl(&["daemon-reload"]);
@@ -165,7 +230,9 @@ fn ensure() -> bool {
     let Some(executable) = trusted_daemon() else {
         return false;
     };
-    if install_unit(&executable) && systemctl(&["enable", "--now", UNIT_NAME]) {
+    if install_unit(&util::systemd_user_dir(), &executable)
+        && systemctl(&["enable", "--now", UNIT_NAME])
+    {
         for _ in 0..60 {
             if ping_sync(Duration::from_millis(500)) {
                 return true;
@@ -186,8 +253,19 @@ fn ensure() -> bool {
 }
 
 pub fn main(args: &[String]) {
+    // `--no-start` talks to a daemon that is already running and never
+    // installs, enables or spawns one (the uninstall script uses it).
+    let (start, args) = match args.split_first() {
+        Some((first, rest)) if first == "--no-start" => (false, rest),
+        _ => (true, args),
+    };
     let request = build(args);
-    if !ensure() {
+    let available = if start {
+        ensure()
+    } else {
+        ping_sync(Duration::from_millis(2000))
+    };
+    if !available {
         println!(
             "{}",
             json!({"ok": false, "error": "cast service unavailable (the backend must be installed at ~/.local/bin/omarchy-castd or /usr/bin/omarchy-castd)"})
@@ -210,6 +288,58 @@ pub fn main(args: &[String]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("unicast-unit-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        dir
+    }
+
+    #[test]
+    fn unit_writes_fresh_and_rewrites_its_own() {
+        let dir = scratch("own");
+        let exe = Path::new("/usr/bin/omarchy-castd");
+        assert!(install_unit(&dir, exe));
+        let written = std::fs::read_to_string(dir.join(UNIT_NAME)).expect("unit");
+        assert!(written.starts_with(UNIT_MARKER));
+        std::fs::write(dir.join(UNIT_NAME), format!("{UNIT_MARKER}\n[Unit]\n")).expect("stale");
+        assert!(install_unit(&dir, exe));
+        assert_eq!(
+            std::fs::read_to_string(dir.join(UNIT_NAME)).expect("unit"),
+            written
+        );
+        for legacy in legacy_units() {
+            std::fs::write(dir.join(UNIT_NAME), &legacy).expect("legacy");
+            assert!(install_unit(&dir, exe));
+            assert_eq!(
+                std::fs::read_to_string(dir.join(UNIT_NAME)).expect("unit"),
+                written
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unit_leaves_foreign_files_and_symlinks_alone() {
+        let dir = scratch("foreign");
+        let exe = Path::new("/usr/bin/omarchy-castd");
+        let foreign = "[Unit]\nDescription=someone else's castd\n[Service]\nExecStart=/opt/castd\n";
+        std::fs::write(dir.join(UNIT_NAME), foreign).expect("foreign");
+        assert!(!install_unit(&dir, exe));
+        assert_eq!(
+            std::fs::read_to_string(dir.join(UNIT_NAME)).expect("unit"),
+            foreign
+        );
+
+        std::fs::remove_file(dir.join(UNIT_NAME)).expect("rm");
+        let target = dir.join("target");
+        std::fs::write(&target, "keep").expect("target");
+        std::os::unix::fs::symlink(&target, dir.join(UNIT_NAME)).expect("link");
+        assert!(!install_unit(&dir, exe));
+        assert_eq!(std::fs::read_to_string(&target).expect("target"), "keep");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn unit_is_bounded_but_keeps_pkexec_usable() {

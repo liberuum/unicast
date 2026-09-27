@@ -118,29 +118,132 @@ pub async fn playback_info(ip: &str, port: u16) -> Option<PlaybackInfo> {
         return None;
     }
     let bytes = util::read_body_capped(response, MAX_PLAYBACK_INFO_BYTES).await?;
-    let value = Value::from_reader(std::io::Cursor::new(bytes.as_slice())).ok()?;
-    let dictionary = value.as_dictionary()?;
-    if dictionary.get("error").is_some() {
+    parse_playback_info(&bytes)
+}
+
+/// Events read from one `/playback-info` reply before giving up. A real one
+/// has a few dozen; the cap is what bounds the work, since binary plist
+/// objects are shared by reference and a small body can describe an
+/// exponentially large tree (which `plist::Value` would build in memory).
+const MAX_PLAYBACK_INFO_EVENTS: usize = 4096;
+
+/// Reads `position`, `duration` and `rate` from the top-level dictionary as
+/// a stream of events, never materialising the document.
+#[allow(clippy::cast_precision_loss)]
+fn parse_playback_info(bytes: &[u8]) -> Option<PlaybackInfo> {
+    use plist::stream::{Event, Reader};
+
+    let mut events = Reader::new(std::io::Cursor::new(bytes));
+    if !matches!(events.next()?.ok()?, Event::StartDictionary(_)) {
         return None;
     }
-    let position = util::media_seconds(real(dictionary, "position"));
-    let duration = util::media_seconds(real(dictionary, "duration"));
-    let rate = real(dictionary, "rate");
+    let (mut position, mut duration, mut rate) = (0.0, 0.0, 0.0);
+    let mut depth = 1usize;
+    let mut key: Option<String> = None;
+    for (count, event) in events.enumerate() {
+        if count >= MAX_PLAYBACK_INFO_EVENTS {
+            return None;
+        }
+        let event = event.ok()?;
+        if depth > 1 {
+            match event {
+                Event::StartArray(_) | Event::StartDictionary(_) => depth += 1,
+                Event::EndCollection => depth -= 1,
+                _ => {}
+            }
+            continue;
+        }
+        let Some(name) = key.take() else {
+            match event {
+                Event::String(name) => key = Some(name.into_owned()),
+                Event::EndCollection => break,
+                _ => return None,
+            }
+            continue;
+        };
+        if name == "error" {
+            return None;
+        }
+        let number = match event {
+            Event::Real(value) => Some(value),
+            Event::Integer(value) => value.as_signed().map(|v| v as f64),
+            Event::StartArray(_) | Event::StartDictionary(_) => {
+                depth += 1;
+                None
+            }
+            _ => None,
+        };
+        if let Some(number) = number {
+            match name.as_str() {
+                "position" => position = number,
+                "duration" => duration = number,
+                "rate" => rate = number,
+                _ => {}
+            }
+        }
+    }
     Some(PlaybackInfo {
-        position,
-        duration,
+        position: util::media_seconds(position),
+        duration: util::media_seconds(duration),
         playing: rate > 0.0,
     })
 }
 
-#[allow(clippy::cast_precision_loss)]
-fn real(dictionary: &Dictionary, key: &str) -> f64 {
-    dictionary
-        .get(key)
-        .and_then(|value| {
-            value
-                .as_real()
-                .or_else(|| value.as_signed_integer().map(|v| v as f64))
-        })
-        .unwrap_or(0.0)
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reads_playback_info() {
+        let body = plist_body(vec![
+            ("duration", Value::Real(120.0)),
+            ("position", Value::Real(30.5)),
+            ("rate", Value::Integer(1.into())),
+            ("loadedTimeRanges", Value::Array(vec![Value::Boolean(true)])),
+        ]);
+        let info = parse_playback_info(&body).expect("info");
+        assert!((info.position - 30.5).abs() < 1e-9);
+        assert!((info.duration - 120.0).abs() < 1e-9);
+        assert!(info.playing);
+        let error = plist_body(vec![("error", Value::String("x".into()))]);
+        assert!(parse_playback_info(&error).is_none());
+    }
+
+    /// A 2 KB binary plist whose top-level dictionary holds five levels of
+    /// 200 shared references: 200^5 nodes if built as a `Value`.
+    #[test]
+    fn shared_reference_bomb_is_refused_quickly() {
+        let (levels, width) = (5usize, 200usize);
+        let key = levels + 2;
+        let mut out = b"bplist00".to_vec();
+        let mut offsets = vec![out.len()];
+        out.extend_from_slice(&[0xd1]);
+        out.extend_from_slice(&u16::try_from(key).expect("ref").to_be_bytes());
+        out.extend_from_slice(&1u16.to_be_bytes());
+        for level in 1..=levels {
+            offsets.push(out.len());
+            out.extend_from_slice(&[0xaf, 0x11]);
+            out.extend_from_slice(&u16::try_from(width).expect("width").to_be_bytes());
+            for _ in 0..width {
+                out.extend_from_slice(&u16::try_from(level + 1).expect("ref").to_be_bytes());
+            }
+        }
+        offsets.push(out.len());
+        out.push(0x09);
+        offsets.push(out.len());
+        out.extend_from_slice(&[0x51, b'x']);
+        let table = out.len();
+        for offset in &offsets {
+            out.extend_from_slice(&u32::try_from(*offset).expect("offset").to_be_bytes());
+        }
+        out.extend_from_slice(&[0; 6]);
+        out.extend_from_slice(&[4, 2]);
+        out.extend_from_slice(&(offsets.len() as u64).to_be_bytes());
+        out.extend_from_slice(&0u64.to_be_bytes());
+        out.extend_from_slice(&(table as u64).to_be_bytes());
+        assert!(out.len() < MAX_PLAYBACK_INFO_BYTES);
+        let started = std::time::Instant::now();
+        assert!(parse_playback_info(&out).is_none());
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
 }

@@ -313,23 +313,27 @@ pub fn discover(media: &Path) -> Vec<SubtitleTrack> {
 /// MKV on slow storage is the slow case).
 const CONVERT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
-/// Whether `path` is valid UTF-8 (a BOM is fine). Unreadable files count as
-/// UTF-8 so ffmpeg gets to report the real error.
-async fn is_utf8_file(path: &Path) -> bool {
-    use tokio::io::AsyncReadExt;
-    let Ok(file) = tokio::fs::File::open(path).await else {
-        return true;
-    };
+/// Opens a sidecar for conversion: a regular file, not a symlink, not over
+/// the size cap, checked on the descriptor itself so a path swapped since
+/// discovery (for a FIFO, a link, a huge file) is refused, and returns whether
+/// its contents are valid UTF-8 (a BOM is fine). ffmpeg then reads that same
+/// descriptor through `/proc/<pid>/fd/<n>`.
+fn pin_sidecar(path: &Path) -> Result<(crate::util::PinnedFile, bool), String> {
+    use std::io::Read;
+    let pinned = crate::util::PinnedFile::open_no_follow(path)
+        .map_err(|error| format!("cannot open the subtitle file: {error}"))?;
+    let mut file = std::fs::File::open(pinned.data_path())
+        .map_err(|error| format!("cannot read the subtitle file: {error}"))?;
     let mut bytes = Vec::new();
-    if file
-        .take(MAX_SIDECAR_BYTES)
+    (&mut file)
+        .take(MAX_SIDECAR_BYTES + 1)
         .read_to_end(&mut bytes)
-        .await
-        .is_err()
-    {
-        return true;
+        .map_err(|error| format!("cannot read the subtitle file: {error}"))?;
+    if bytes.len() as u64 > MAX_SIDECAR_BYTES {
+        return Err("the subtitle file is too large".to_string());
     }
-    std::str::from_utf8(&bytes).is_ok()
+    let utf8 = std::str::from_utf8(&bytes).is_ok();
+    Ok((pinned, utf8))
 }
 
 /// Path of the `WebVTT` file for `track`, converting it into `dir` on first use.
@@ -346,16 +350,25 @@ pub async fn ensure_vtt(
         .await
         .map_err(|error| format!("cannot create subtitle cache: {error}"))?;
     let part = dir.join(format!("{}.vtt.part", track.id));
+    // Held until the conversion ends, so ffmpeg reads the file checked here.
+    let mut _pinned = None;
     let attempts: Vec<Vec<String>> = match &track.source {
-        // Older .srt files are often Latin-1. ffmpeg does not fail on them, it
-        // silently drops every line with invalid UTF-8, so decide up front.
-        SubtitleSource::Sidecar(path) if !is_utf8_file(path).await => {
-            vec![ffmpeg_args(path, None, Some("ISO-8859-1"))]
+        SubtitleSource::Sidecar(path) => {
+            let (pinned, utf8) = pin_sidecar(path)?;
+            let source = pinned.data_path();
+            _pinned = Some(pinned);
+            // Older .srt files are often Latin-1. ffmpeg does not fail on
+            // them, it silently drops every line with invalid UTF-8, so
+            // decide up front.
+            if utf8 {
+                vec![
+                    ffmpeg_args(&source, None, None),
+                    ffmpeg_args(&source, None, Some("ISO-8859-1")),
+                ]
+            } else {
+                vec![ffmpeg_args(&source, None, Some("ISO-8859-1"))]
+            }
         }
-        SubtitleSource::Sidecar(path) => vec![
-            ffmpeg_args(path, None, None),
-            ffmpeg_args(path, None, Some("ISO-8859-1")),
-        ],
         SubtitleSource::Embedded { stream_index } => {
             vec![ffmpeg_args(media, Some(*stream_index), None)]
         }

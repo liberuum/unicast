@@ -2,6 +2,7 @@
 # Remove everything omarchy-cast put on this machine outside the plugin folder:
 # the daemon binary, its systemd user unit, build cache, runtime state, and the
 # per-receiver ufw rules it added (each removal is authorized through polkit).
+# A file at one of those paths that UniCast did not create is left in place.
 #
 #   omarchy-cast-uninstall           keep ~/.config/omarchy/cast (settings)
 #   omarchy-cast-uninstall --purge   delete the settings too
@@ -20,20 +21,27 @@ for arg in "$@"; do
   esac
 done
 
-UNIT=omarchy-castd.service
-BIN=$HOME/.local/bin/omarchy-castd
-CONFIG=${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/cast
-UNIT_FILE=${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/$UNIT
-CACHE=${XDG_CACHE_HOME:-$HOME/.cache}/omarchy-cast
+HERE=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+# Paths, the ownership record, sha(), bin_is_ours() and unit_is_ours().
+. "$HERE/lib/ownership.sh"
 RUNTIME=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/universal-cast
 
 say() { printf '\033[1momarchy-cast:\033[0m %s\n' "$*"; }
 
-# 1. Firewall rules: ask the daemon to delete the rules it recorded.
+# Decide ownership before anything is removed: the binary check can rely on
+# the build cache, which goes below.
+OURS_BIN=0; bin_is_ours && OURS_BIN=1
+OURS_UNIT=0; unit_is_ours && OURS_UNIT=1
+OURS_CACHE=0; [[ -d $CACHE && ! -L $CACHE && -f $CACHE_MARKER ]] && OURS_CACHE=1
+
+# 1. Firewall rules: ask the daemon to delete the rules it recorded. Only the
+# binary setup installed is run, never whatever else sits at that path, and
+# with --no-start it only talks to a daemon that is already running: it never
+# installs, enables or spawns one.
 if [[ -s $CONFIG/firewall-rules ]]; then
-  if [[ -x $BIN ]]; then
+  if (( OURS_BIN )); then
     say "removing the ufw rules the daemon added (polkit will ask)"
-    "$BIN" --client clear-firewall >/dev/null 2>&1 || true
+    "$BIN" --client --no-start clear-firewall >/dev/null 2>&1 || true
   fi
   if [[ -s $CONFIG/firewall-rules ]]; then
     say "these ufw rules were not removed; delete them with sudo ufw delete, or list them with: sudo ufw status | grep universal-cast"
@@ -43,39 +51,60 @@ if [[ -s $CONFIG/firewall-rules ]]; then
   fi
 fi
 
-# 2. Daemon and unit. The binaries go first (the installed one and the build
-# cache that bin/omarchy-cast falls back to): a status poll from the still
+# 2. Daemon and unit. The binary goes first: a status poll from the still
 # loaded widget would otherwise respawn the daemon and rewrite the unit file
 # between the stop and the removal below.
-rm -f "$BIN"
-rm -rf "$CACHE"
-if systemctl --user list-unit-files "$UNIT" >/dev/null 2>&1; then
-  systemctl --user disable --now "$UNIT" >/dev/null 2>&1 || true
+if (( OURS_BIN )); then
+  rm -f -- "$BIN" "$OWNED"
+  say "removed $BIN"
+elif [[ -e $BIN || -L $BIN ]]; then
+  say "kept $BIN: it is not the binary the setup script installed"
 fi
-rm -f "$UNIT_FILE"
-systemctl --user daemon-reload >/dev/null 2>&1 || true
+if (( OURS_CACHE )); then
+  rm -rf -- "$CACHE"
+  say "removed $CACHE"
+elif [[ -e $CACHE || -L $CACHE ]]; then
+  say "kept $CACHE: it was not created by the setup script"
+fi
+if (( OURS_UNIT )); then
+  systemctl --user disable --now "$UNIT" >/dev/null 2>&1 || true
+  rm -f -- "$UNIT_FILE"
+  systemctl --user daemon-reload >/dev/null 2>&1 || true
+  say "stopped and removed $UNIT"
+elif [[ -e $UNIT_FILE || -L $UNIT_FILE ]]; then
+  say "kept $UNIT_FILE: it was not written by UniCast"
+fi
 # A daemon started outside systemd (the client's fallback) survives the unit
 # stop. Signal only processes of this user whose executable is the binary
 # removed above, never anything that merely shares the name.
-for pid in $(pgrep -u "$(id -u)" -x omarchy-castd 2>/dev/null); do
-  exe=$(readlink "/proc/$pid/exe" 2>/dev/null) || continue
-  if [[ $exe == "$BIN" || $exe == "$BIN (deleted)" ]]; then
-    kill "$pid" 2>/dev/null || true
+if (( OURS_BIN )); then
+  for pid in $(pgrep -u "$(id -u)" -x omarchy-castd 2>/dev/null); do
+    exe=$(readlink "/proc/$pid/exe" 2>/dev/null) || continue
+    if [[ $exe == "$BIN" || $exe == "$BIN (deleted)" ]]; then
+      kill "$pid" 2>/dev/null || true
+    fi
+  done
+fi
+
+# 3. Runtime state: only the entries the daemon creates, then the folder if
+# that left it empty.
+if [[ -d $RUNTIME && ! -L $RUNTIME ]]; then
+  rm -f -- "$RUNTIME/castd.sock" "$RUNTIME/castd.lock"
+  rm -rf -- "$RUNTIME/subtitles"
+  rmdir -- "$RUNTIME" 2>/dev/null || true
+  say "removed runtime state"
+fi
+
+# 4. Settings only on request, and only the files the daemon writes.
+if (( PURGE )) && [[ -d $CONFIG && ! -L $CONFIG ]]; then
+  rm -f -- "$CONFIG/settings.json" "$CONFIG/manual-ips" "$CONFIG"/*.tmp.* "$OWNED" "$OWNED.tmp"
+  if (( KEEP_LEDGER )); then
+    say "removed settings in $CONFIG except firewall-rules (rules above still exist)"
+  else
+    rm -f -- "$CONFIG/firewall-rules"
+    rmdir -- "$CONFIG" 2>/dev/null || say "kept other files in $CONFIG that UniCast did not write"
+    say "removed settings in $CONFIG"
   fi
-done
-say "stopped and removed $UNIT"
-
-# 3. Runtime state.
-rm -rf "$RUNTIME"
-say "removed $BIN, $CACHE and runtime state"
-
-# 4. Settings only on request.
-if (( PURGE )) && (( KEEP_LEDGER )); then
-  find "$CONFIG" -mindepth 1 -maxdepth 1 ! -name firewall-rules -exec rm -rf -- {} +
-  say "removed settings in $CONFIG except firewall-rules (rules above still exist)"
-elif (( PURGE )); then
-  rm -rf "$CONFIG"
-  say "removed settings in $CONFIG"
 else
   say "kept settings in $CONFIG (use --purge to delete them)"
 fi

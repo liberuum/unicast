@@ -1,0 +1,78 @@
+#!/usr/bin/env bash
+# The uninstall script removes only what UniCast created: run it against a
+# throwaway HOME holding foreign files at every path it touches, then against
+# one holding UniCast's own. systemctl and pgrep are stubbed, so nothing on
+# the real session is touched.
+set -euo pipefail
+cd "$(dirname -- "$0")/.."
+
+ROOT=$(mktemp -d)
+trap 'rm -rf -- "$ROOT"' EXIT
+mkdir -p "$ROOT/stub"
+printf '#!/bin/sh\necho "systemctl $*" >>"%s/systemctl.log"\n' "$ROOT" >"$ROOT/stub/systemctl"
+printf '#!/bin/sh\nexit 1\n' >"$ROOT/stub/pgrep"
+chmod +x "$ROOT/stub/systemctl" "$ROOT/stub/pgrep"
+
+fresh_home() {
+  H=$ROOT/home-$1
+  mkdir -p "$H/.local/bin" "$H/.config/systemd/user" "$H/.config/omarchy/cast" "$H/.cache/universal-cast" "$H/run"
+}
+run_uninstall() {
+  env -i HOME="$H" PATH="$ROOT/stub:/usr/bin:/bin" XDG_RUNTIME_DIR="$H/run" \
+    bash bin/omarchy-cast-uninstall --purge >/dev/null
+}
+fail() { echo "uninstall-ownership: $*" >&2; exit 1; }
+
+# Foreign files at every path: all of them survive, and no unit is touched.
+fresh_home foreign
+printf '#!/bin/sh\necho someone else\n' >"$H/.local/bin/omarchy-castd"
+printf 'not ours\n' >"$H/.config/omarchy/cast/installed-binary.sha256"
+printf '[Unit]\nDescription=someone else\n' >"$H/.config/systemd/user/omarchy-castd.service"
+printf 'keep\n' >"$H/.cache/universal-cast/their-file"
+printf 'keep\n' >"$H/.config/omarchy/cast/their-file"
+run_uninstall
+[[ -f $H/.local/bin/omarchy-castd ]] || fail "removed a foreign binary"
+[[ -f $H/.config/systemd/user/omarchy-castd.service ]] || fail "removed a foreign unit"
+[[ -f $H/.cache/universal-cast/their-file ]] || fail "removed an unmarked cache"
+[[ -f $H/.config/omarchy/cast/their-file ]] || fail "removed a foreign settings file"
+[[ ! -e $ROOT/systemctl.log ]] || fail "ran systemctl for a foreign unit: $(cat "$ROOT/systemctl.log")"
+
+# A symlinked unit is not ours either, and its target is left alone.
+fresh_home link
+printf '# Written by UniCast (universal-cast); omarchy-cast-uninstall removes it.\n' >"$H/target.service"
+ln -s "$H/target.service" "$H/.config/systemd/user/omarchy-castd.service"
+run_uninstall
+[[ -L $H/.config/systemd/user/omarchy-castd.service && -f $H/target.service ]] || fail "followed a unit symlink"
+
+# UniCast's own files: all removed. The firewall step talks only to a
+# running daemon (--no-start), so it cannot install or enable a unit.
+fresh_home own
+printf '#!/bin/sh\necho "$*" >>"%s/castd.log"\n' "$ROOT" >"$H/.local/bin/omarchy-castd"
+chmod +x "$H/.local/bin/omarchy-castd"
+printf 'allow from 192.168.1.20\n' >"$H/.config/omarchy/cast/firewall-rules"
+sha256sum "$H/.local/bin/omarchy-castd" | cut -d' ' -f1 >"$H/.config/omarchy/cast/installed-binary.sha256"
+printf '# Written by UniCast (universal-cast); omarchy-cast-uninstall removes it.\n[Unit]\n' >"$H/.config/systemd/user/omarchy-castd.service"
+: >"$H/.cache/universal-cast/.created-by-unicast-setup"
+printf '{}\n' >"$H/.config/omarchy/cast/settings.json"
+run_uninstall
+[[ ! -e $H/.local/bin/omarchy-castd ]] || fail "kept the installed binary"
+[[ ! -e $H/.config/systemd/user/omarchy-castd.service ]] || fail "kept UniCast's unit"
+[[ ! -e $H/.cache/universal-cast ]] || fail "kept the build cache"
+# The stub daemon cleared nothing, so only the rule record stays for a later run.
+[[ $(ls -A "$H/.config/omarchy/cast") == firewall-rules ]] || fail "purge left: $(ls -A "$H/.config/omarchy/cast")"
+grep -q 'disable --now omarchy-castd.service' "$ROOT/systemctl.log" || fail "did not disable UniCast's unit"
+[[ $(cat "$ROOT/castd.log") == "--client --no-start clear-firewall" ]] || fail "firewall step could start the daemon: $(cat "$ROOT/castd.log")"
+
+# An install from before the ownership record: the binary matches setup's
+# cached build, and the unit is byte-for-byte the 0.1.5 template.
+fresh_home legacy
+mkdir -p "$H/.cache/omarchy-cast/target/release"
+printf '#!/bin/sh\n' | tee "$H/.local/bin/omarchy-castd" >"$H/.cache/omarchy-cast/target/release/omarchy-castd"
+printf '[Unit]\nDescription=omarchy-cast media daemon\n\n[Service]\nType=simple\nExecStart="%s"\nRestart=on-failure\nRestartSec=1\nUMask=0077\nTasksMax=1024\nMemoryMax=4G\nOOMScoreAdjust=200\nKeyringMode=private\n\n[Install]\nWantedBy=default.target\n' \
+  "$H/.local/bin/omarchy-castd" >"$H/.config/systemd/user/omarchy-castd.service"
+run_uninstall
+[[ ! -e $H/.local/bin/omarchy-castd ]] || fail "kept a pre-record install's binary"
+[[ ! -e $H/.config/systemd/user/omarchy-castd.service ]] || fail "kept a pre-marker unit"
+[[ -f $H/.cache/omarchy-cast/target/release/omarchy-castd ]] || fail "deleted the pre-0.1.6 cache, which nothing proves is ours"
+
+echo "uninstall-ownership: OK"

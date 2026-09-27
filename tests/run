@@ -67,8 +67,9 @@ else
 fi
 
 step "shell scripts"
-bash -n bin/omarchy-cast bin/omarchy-cast-setup bin/omarchy-cast-uninstall
+bash -n bin/omarchy-cast bin/omarchy-cast-setup bin/omarchy-cast-uninstall lib/ownership.sh
 test -x bin/omarchy-cast && test -x bin/omarchy-cast-setup && test -x bin/omarchy-cast-uninstall
+tests/uninstall-ownership
 
 step "rust"
 cargo fmt --check

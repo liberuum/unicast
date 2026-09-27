@@ -1,5 +1,60 @@
 # Changelog
 
+## 0.1.6 — 2026-09-27
+
+### Security
+
+Marketplace review of 0.1.5 (shared install paths), applied to every path
+UniCast writes or removes outside the plugin folder:
+
+- Setup records the SHA-256 of the daemon it installs in
+  `~/.config/omarchy/cast/installed-binary.sha256`, and refuses to replace a
+  `~/.local/bin/omarchy-castd` that does not match it (or, for an install
+  from before the record, the previous build in setup's own cache). The new
+  binary is copied to a sibling temp file and renamed into place.
+- The unit file starts with a marker line. The client rewrites
+  `omarchy-castd.service` only when it is missing, carries the marker, or is
+  byte-for-byte a unit an earlier release wrote; a symlink or anyone else's
+  unit is left alone (not rewritten, enabled, started or stopped) and the
+  daemon runs outside systemd instead. The write goes to a new temp file that
+  is renamed over the unit, never through a link.
+- The build cache moves to `~/.cache/universal-cast/`. Setup marks it only
+  in the step that creates it and refuses a folder of that name it did not
+  create. The old `~/.cache/omarchy-cast/` is only read (to recognise an
+  existing install) and never deleted; remove it yourself after upgrading.
+- Setup checks the installed binary again right before replacing it, not
+  only before the build. Its records and the daemon's settings files are
+  written to fresh temp files, never through a planted link.
+- Uninstall applies the same checks: it runs and deletes only UniCast's
+  binary, disables and deletes only UniCast's unit, deletes the build cache
+  only if setup created it, and removes only the settings and runtime files
+  the daemon writes, leaving any other file in those folders. Its firewall
+  step uses the new `--client --no-start`, which talks only to a daemon that
+  is already running, so uninstall can no longer install or enable a unit.
+  A test runs it against a home of foreign files and one of UniCast's own.
+
+An audit of the rest of the daemon for the same kind of problem found:
+
+- **Firewall.** `ufw allow` replaces an existing rule for the same traffic
+  that differs only in action or comment ("Rule updated"), so a user's deny
+  rule could become UniCast's allow and later be deleted by uninstall. The
+  daemon now reads `/etc/ufw/user.rules` first and leaves any such rule
+  alone, and records a rule only when ufw answers exactly "Rule added". If
+  the rules file cannot be read it changes nothing and prints the command
+  to run.
+- **AirPlay.** `/playback-info` was capped at 64 KiB but parsed into a full
+  `plist::Value`. A binary plist's shared references let a 2 KB reply expand
+  to 200^5 nodes and exhaust memory. It is now read as an event stream,
+  capped at 4096 events, taking only the three numbers it needs. `plist` is
+  pinned to exactly 1.10.1 for the streaming API.
+- **FIFOs.** Media and subtitle files are opened with `O_NONBLOCK` and must
+  be regular files, so a FIFO named by an MPRIS player or put next to a
+  video no longer blocks a daemon thread. A sidecar subtitle is opened
+  without following links, size-checked on the descriptor, and ffmpeg reads
+  that same descriptor.
+- **SSDP.** Replies from senders that are not a LAN IPv4 address are dropped
+  before the device description is fetched.
+
 ## 0.1.5 — 2026-09-27
 
 ### Security
