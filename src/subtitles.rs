@@ -392,7 +392,7 @@ pub async fn ensure_vtt(
         if status.is_ok_and(|status| status.is_ok_and(|status| status.success()))
             && tokio::fs::metadata(&part)
                 .await
-                .is_ok_and(|meta| meta.len() > 0)
+                .is_ok_and(|meta| meta.len() > 0 && meta.len() <= MAX_VTT_BYTES)
             && tokio::fs::rename(&part, &target).await.is_ok()
         {
             return Ok(target);
@@ -418,10 +418,12 @@ fn ffmpeg_args(source: &Path, stream_index: Option<u32>, charenc: Option<&str>) 
         args.push("-map".to_string());
         args.push(format!("0:{index}"));
     }
-    // Stop writing at the cap: a crafted track must not fill the RAM-backed
-    // runtime directory the cache lives in.
+    // Stop writing just past the cap: a crafted track must not fill the
+    // RAM-backed runtime directory the cache lives in. ffmpeg stops once the
+    // output reaches this size and still exits 0, so a result over the cap
+    // is a cut-off track and `ensure_vtt` refuses it.
     args.push("-fs".to_string());
-    args.push(MAX_VTT_BYTES.to_string());
+    args.push((MAX_VTT_BYTES + 1).to_string());
     args.push("-f".to_string());
     args.push("webvtt".to_string());
     args

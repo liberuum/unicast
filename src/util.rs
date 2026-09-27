@@ -322,7 +322,8 @@ const FFPROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 const FFPROBE_MAX_OUTPUT: u64 = 4 * 1024 * 1024;
 
 /// Run ffprobe on a local file with a deadline and a stdout cap. `None` on
-/// spawn failure or timeout (the process is killed).
+/// spawn failure, timeout (the process is killed) or output over the cap: a
+/// cut-off answer is never parsed as if it were the whole one.
 pub fn ffprobe(args: &[&str], path: &Path) -> Option<Vec<u8>> {
     use std::io::Read;
     let mut child = std::process::Command::new("ffprobe")
@@ -336,8 +337,11 @@ pub fn ffprobe(args: &[&str], path: &Path) -> Option<Vec<u8>> {
     let stdout = child.stdout.take()?;
     let reader = std::thread::spawn(move || {
         let mut bytes = Vec::new();
-        let _ = stdout.take(FFPROBE_MAX_OUTPUT).read_to_end(&mut bytes);
-        bytes
+        let complete = stdout
+            .take(FFPROBE_MAX_OUTPUT + 1)
+            .read_to_end(&mut bytes)
+            .is_ok_and(|read| read as u64 <= FFPROBE_MAX_OUTPUT);
+        complete.then_some(bytes)
     });
     let deadline = std::time::Instant::now() + FFPROBE_TIMEOUT;
     loop {
@@ -353,7 +357,7 @@ pub fn ffprobe(args: &[&str], path: &Path) -> Option<Vec<u8>> {
             }
         }
     }
-    reader.join().ok()
+    reader.join().ok().flatten()
 }
 
 pub fn expand_tilde(path: &str) -> String {

@@ -7,12 +7,23 @@ use crate::util;
 const UFW: &str = "/usr/bin/ufw";
 const PKEXEC: &str = "/usr/bin/pkexec";
 const TIMEOUT: Duration = Duration::from_secs(60);
-/// ufw's saved rules; world-readable on Arch. Read to see what already exists.
+/// ufw's saved IPv4 rules; world-readable on Arch. Read to see what already exists.
 const USER_RULES: &str = "/etc/ufw/user.rules";
-const USER_RULES_MAX: u64 = 4 * 1024 * 1024;
+/// Longest line accepted from it; ufw's own lines are well under 1 KiB.
+const USER_RULES_MAX_LINE: usize = 64 * 1024;
 
+/// Whether ufw is enabled, read the way ufw reads its own config: an
+/// `ENABLED=yes` line (quotes allowed), not the text appearing anywhere.
 pub fn active() -> bool {
-    std::fs::read_to_string("/etc/ufw/ufw.conf").is_ok_and(|text| text.contains("ENABLED=yes"))
+    std::fs::read_to_string("/etc/ufw/ufw.conf").is_ok_and(|text| enabled_in(&text))
+}
+
+fn enabled_in(conf: &str) -> bool {
+    conf.lines().any(|line| {
+        line.trim()
+            .strip_prefix("ENABLED=")
+            .is_some_and(|value| value.trim().trim_matches('"') == "yes")
+    })
 }
 
 /// One rule the daemon added: traffic from `receiver` to the media server on
@@ -124,9 +135,13 @@ pub async fn open(receiver: &str, bind: Ipv4Addr, port: u16) -> Result<(), Strin
     // `ufw allow` does not skip a rule for the same traffic that differs only
     // in action or comment: it replaces it with ours ("Rule updated"), turning
     // a user's deny into an allow, and `clear` would later delete it. Any such
-    // rule is the user's decision, so it is left exactly as it is.
-    match read_user_rules() {
-        Some(text) if user_has_rule(&text, &rule) => {
+    // rule is the user's decision, so it is left exactly as it is. (Only root
+    // can change the rules, so the time between this check and the polkit
+    // prompt below is not something another program can use; if the user adds
+    // such a rule in that window, ufw answers "Rule updated", which is logged
+    // and never recorded.)
+    match user_rules_have(&rule) {
+        Some(true) => {
             tracing::info!(
                 "ufw already has a rule for {} -> {}:{}; leaving it as it is",
                 rule.receiver,
@@ -135,10 +150,10 @@ pub async fn open(receiver: &str, bind: Ipv4Addr, port: u16) -> Result<(), Strin
             );
             return Ok(());
         }
-        Some(_) => {}
+        Some(false) => {}
         None => {
             return Err(format!(
-                "Cannot read {USER_RULES} to check for a rule of yours, so the firewall was not changed. Allow the receiver yourself: sudo ufw allow from {} proto tcp to {} port {}",
+                "Cannot read all of {USER_RULES} to check for a rule of yours, so the firewall was not changed. Allow the receiver yourself: sudo ufw allow from {} proto tcp to {} port {}",
                 rule.receiver, rule.bind, rule.port
             ));
         }
@@ -153,8 +168,11 @@ pub async fn open(receiver: &str, bind: Ipv4Addr, port: u16) -> Result<(), Strin
         write_ledger(&rules);
     } else {
         tracing::warn!(
-            "ufw did not add a new rule ({}); not recording it",
-            stdout.trim()
+            "ufw did not add a new rule ({}); a rule of yours for {} -> {}:{} exists, so it is not recorded or ever deleted",
+            stdout.trim(),
+            rule.receiver,
+            rule.bind,
+            rule.port
         );
     }
     Ok(())
@@ -208,39 +226,71 @@ async fn run_output(args: &[String]) -> Option<String> {
     }
 }
 
-fn read_user_rules() -> Option<String> {
-    use std::io::Read;
-    let mut text = String::new();
-    std::fs::File::open(USER_RULES)
-        .ok()?
-        .take(USER_RULES_MAX)
-        .read_to_string(&mut text)
-        .ok()?;
-    Some(text)
+/// Whether ufw's saved rules already hold one for the same traffic as
+/// `rule`. The whole file is read, a line at a time so memory stays bounded
+/// however long it is. `None` when it cannot be read to the end (missing,
+/// unreadable, a read error, an oversized line): a rule past that point could
+/// be the one `ufw allow` would replace, so the caller changes nothing.
+fn user_rules_have(rule: &Rule) -> Option<bool> {
+    let file = std::fs::File::open(USER_RULES).ok()?;
+    scan_user_rules(std::io::BufReader::new(file), rule)
 }
 
-/// Whether ufw's saved rules hold one for the same traffic as `rule` (tcp from
-/// the receiver to bind:port, inbound on any interface), whatever its action,
-/// logging or comment: exactly the rules `ufw allow` would replace.
-fn user_has_rule(user_rules: &str, rule: &Rule) -> bool {
-    let port = rule.port.to_string();
+fn scan_user_rules(mut reader: impl std::io::BufRead, rule: &Rule) -> Option<bool> {
+    use std::io::{BufRead, Read};
+    let limit = u64::try_from(USER_RULES_MAX_LINE).ok()?;
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        (&mut reader)
+            .take(limit)
+            .read_until(b'\n', &mut line)
+            .ok()?;
+        if line.is_empty() {
+            return Some(false);
+        }
+        if line.len() >= USER_RULES_MAX_LINE && line.last() != Some(&b'\n') {
+            return None;
+        }
+        if tuple_matches(&String::from_utf8_lossy(&line), rule) {
+            return Some(true);
+        }
+    }
+}
+
+/// Reads a `### tuple ###` line the way ufw loads it (`_read_rules` in
+/// `ufw/backend_iptables.py`) and compares it the way `UFWRule.match` does:
+/// same protocol, ports, addresses, applications, interface, direction and
+/// chain, whatever the action, log type or comment. Exactly the rules
+/// `ufw allow` would replace with ours.
+fn tuple_matches(line: &str, rule: &Rule) -> bool {
+    let Some(tuple) = line.strip_prefix("### tuple ###") else {
+        return false;
+    };
+    // ufw strips everything from the first " comment=".
+    let tuple = tuple
+        .split_once(" comment=")
+        .map_or(tuple, |(head, _)| head);
+    let fields: Vec<&str> = tuple.split_whitespace().collect();
+    // action proto dport dst sport src [dapp sapp] [direction or interface];
+    // the 6 and 8 field forms predate the direction field and mean "in".
+    let (action, proto, dport, dst, sport, src, apps, direction) = match fields.as_slice() {
+        [a, p, dp, d, sp, s] => (*a, *p, *dp, *d, *sp, *s, ("-", "-"), "in"),
+        [a, p, dp, d, sp, s, dir] => (*a, *p, *dp, *d, *sp, *s, ("-", "-"), *dir),
+        [a, p, dp, d, sp, s, da, sa] => (*a, *p, *dp, *d, *sp, *s, (*da, *sa), "in"),
+        [a, p, dp, d, sp, s, da, sa, dir] => (*a, *p, *dp, *d, *sp, *s, (*da, *sa), *dir),
+        _ => return false,
+    };
     let bare = |address: &str| address.strip_suffix("/32").unwrap_or(address).to_string();
-    user_rules.lines().any(|line| {
-        let Some(tuple) = line.strip_prefix("### tuple ###") else {
-            return false;
-        };
-        let fields: Vec<&str> = tuple.split_whitespace().collect();
-        // action proto dport dst sport src direction [comment=...]
-        let fields = match fields.as_slice() {
-            [head @ .., last] if last.starts_with("comment=") => head,
-            all => all,
-        };
-        matches!(
-            fields,
-            [_, "tcp", dport, dst, "any", src, "in"]
-                if *dport == port && bare(dst) == rule.bind && bare(src) == rule.receiver
-        )
-    })
+    // "route:<action>" is a forward-chain rule, which ufw never matches to ours.
+    !action.contains(':')
+        && proto == "tcp"
+        && dport == rule.port.to_string()
+        && sport == "any"
+        && bare(dst) == rule.bind
+        && bare(src) == rule.receiver
+        && apps == ("-", "-")
+        && direction == "in"
 }
 
 /// Only ufw's "Rule added" means a new rule of ours exists. It exits 0 with
@@ -293,28 +343,72 @@ mod tests {
     }
 
     #[test]
+    fn enabled_is_read_as_a_setting() {
+        assert!(enabled_in("# comment\nENABLED=yes\nLOGLEVEL=low\n"));
+        assert!(enabled_in("ENABLED=\"yes\"\n"));
+        assert!(!enabled_in(
+            "ENABLED=no\n# set ENABLED=yes to start on boot\n"
+        ));
+        assert!(!enabled_in("#ENABLED=yes\n"));
+    }
+
+    fn scan(text: &str, rule: &Rule) -> Option<bool> {
+        scan_user_rules(std::io::Cursor::new(text.as_bytes()), rule)
+    }
+
+    #[test]
     fn a_users_rule_for_the_same_traffic_is_left_alone() {
         let rule = Rule::parse("192.168.1.8 192.168.1.6 60020", 1).expect("rule");
         for tuple in [
             "### tuple ### deny tcp 60020 192.168.1.6 any 192.168.1.8 in",
             "### tuple ### allow tcp 60020 192.168.1.6 any 192.168.1.8 in",
             "### tuple ### allow_log tcp 60020 192.168.1.6/32 any 192.168.1.8/32 in comment=6d696e65",
+            "### tuple ### reject tcp 60020 192.168.1.6 any 192.168.1.8 in comment=a comment=b",
+            // Pre-direction forms, which ufw loads as inbound.
+            "### tuple ### deny tcp 60020 192.168.1.6 any 192.168.1.8",
+            "### tuple ### limit tcp 60020 192.168.1.6 any 192.168.1.8 - -",
+            "### tuple ### deny tcp 60020 192.168.1.6 any 192.168.1.8 - - in",
         ] {
-            assert!(
-                user_has_rule(&format!("*filter\n{tuple}\n"), &rule),
+            assert_eq!(
+                scan(&format!("*filter\n{tuple}\n"), &rule),
+                Some(true),
                 "{tuple}"
             );
+            // No trailing newline on the last line is still read.
+            assert_eq!(scan(tuple, &rule), Some(true), "{tuple}");
         }
         for tuple in [
             "### tuple ### deny tcp 60021 192.168.1.6 any 192.168.1.8 in",
             "### tuple ### deny udp 60020 192.168.1.6 any 192.168.1.8 in",
+            "### tuple ### deny any 60020 192.168.1.6 any 192.168.1.8 in",
             "### tuple ### deny tcp 60020 0.0.0.0/0 any 192.168.1.8 in",
             "### tuple ### deny tcp 60020 192.168.1.6 any 192.168.1.9 in",
+            "### tuple ### deny tcp 60020 192.168.1.6 1234 192.168.1.8 in",
             "### tuple ### deny tcp 60020 192.168.1.6 any 192.168.1.8 in_eth0",
+            "### tuple ### deny tcp 60020 192.168.1.6 any 192.168.1.8 out",
+            "### tuple ### route:deny tcp 60020 192.168.1.6 any 192.168.1.8 in",
+            "### tuple ### deny tcp 60020 192.168.1.6 any 192.168.1.8 Cast - in",
             "# deny tcp 60020 192.168.1.6 any 192.168.1.8 in",
         ] {
-            assert!(!user_has_rule(tuple, &rule), "{tuple}");
+            assert_eq!(scan(tuple, &rule), Some(false), "{tuple}");
         }
+    }
+
+    #[test]
+    fn user_rules_are_read_to_the_end_or_not_trusted() {
+        let rule = Rule::parse("192.168.1.8 192.168.1.6 60020", 1).expect("rule");
+        // A matching rule after far more than any fixed cap is still found.
+        let filler = "-A ufw-user-input -p tcp --dport 22 -j ACCEPT\n".repeat(200_000);
+        let text = format!("{filler}### tuple ### deny tcp 60020 192.168.1.6 any 192.168.1.8 in\n");
+        assert!(text.len() > 8 * 1024 * 1024);
+        assert_eq!(scan(&text, &rule), Some(true));
+        // A line too long to read is not skipped: the result is "unknown".
+        let long = format!(
+            "{}\n### tuple ### deny tcp 60020 192.168.1.6 any 192.168.1.8 in\n",
+            "x".repeat(USER_RULES_MAX_LINE + 10)
+        );
+        assert_eq!(scan(&long, &rule), None);
+        assert_eq!(scan("", &rule), Some(false));
     }
 
     #[test]

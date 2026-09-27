@@ -23,8 +23,10 @@ within a week.
 - Privileged actions, each confirmed with you: setup installs missing packages
   with `omarchy pkg add`, and casting may run `pkexec ufw allow from
   <receiver-ip> proto tcp to <your-lan-ip> port <port>`. A rule you already
-  have for that traffic (allow or deny) is never replaced, and only rules
-  ufw reports as newly added are recorded and later deleted.
+  have for that traffic (allow or deny) is never replaced: the whole ufw
+  rules file is checked first, and if it cannot be read in full the
+  firewall is left unchanged. Only rules ufw reports as newly added are
+  recorded and later deleted.
 - The daemon and scripts act only on what UniCast created: no process is
   signalled unless it is the installed `omarchy-castd` binary, and a busy
   media port is reported, not reclaimed. Setup replaces, and uninstall
@@ -33,6 +35,8 @@ within a week.
   `omarchy-castd.service` only if it is a regular file carrying UniCast's
   marker line; the build cache is removed only if setup created it, and
   settings only as the named files the daemon writes.
+- A capped read is never treated as complete: input that reaches a cap is
+  refused, not parsed as if it were the whole thing.
 - Untrusted structured input is bounded in work as well as size: AirPlay's
   binary plist replies are read as a capped event stream, never built as a
   tree. Files are opened non-blocking and must be regular files, so a FIFO

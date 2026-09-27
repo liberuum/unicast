@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.1.7 — 2026-09-27
+
+### Security
+
+Marketplace review of 0.1.6, plus an audit for the same class of issue
+(a capped read treated as complete):
+
+- The check for an existing ufw rule read at most 4 MiB of
+  `/etc/ufw/user.rules` and treated a cut-off read as the whole file, so a
+  user rule past that point could be missed and replaced by `ufw allow`. The
+  whole file is now read, one line at a time so memory stays bounded; a
+  read error or an oversized line means "unknown", and the firewall is not
+  changed (the daemon reports the command to run instead).
+- The check now reads rule lines exactly as ufw loads and compares them,
+  including the older 6- and 8-field forms without a direction (which ufw
+  treats as inbound) and application fields, so no rule `ufw allow` would
+  replace goes unseen.
+- ufw is taken to be enabled only for an `ENABLED=yes` setting line in
+  `ufw.conf`, not for that text appearing anywhere (a comment).
+- ffprobe output over its 4 MiB cap is a failure, not a shorter answer.
+- A subtitle conversion that ffmpeg stopped at the size cap is refused
+  rather than served as a complete track.
+- An SSDP reply longer than the 4 KiB read buffer (cut off by the kernel)
+  is dropped rather than parsed.
+
 ## 0.1.6 — 2026-09-27
 
 ### Security

@@ -57,6 +57,9 @@ fn lan_sender(ip: IpAddr) -> bool {
     matches!(ip, IpAddr::V4(ip) if util::lan_ipv4(ip))
 }
 
+/// Largest SSDP reply read; real ones are a few hundred bytes.
+const MAX_SSDP_REPLY: usize = 4096;
+
 fn collect_locations(socket: &UdpSocket, window: Duration) -> HashSet<String> {
     collect_locations_from(socket, window, lan_sender)
 }
@@ -69,11 +72,13 @@ fn collect_locations_from(
     let deadline = Instant::now() + window;
     let mut locations = HashSet::new();
     let mut per_host: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-    let mut buffer = [0_u8; 4096];
+    // One byte more than any reply we accept: a datagram that fills it was
+    // longer and the kernel cut it off, so it is dropped rather than parsed.
+    let mut buffer = [0_u8; MAX_SSDP_REPLY + 1];
     while Instant::now() < deadline {
         match socket.recv_from(&mut buffer) {
             Ok((len, from)) => {
-                if !accept(from.ip()) {
+                if len > MAX_SSDP_REPLY || !accept(from.ip()) {
                     continue;
                 }
                 let text = String::from_utf8_lossy(&buffer[..len]);
